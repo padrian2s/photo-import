@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "photo-import"
+version = "1.0.0"
+description = "A tool to scan photos, extract EXIF dates, and organize them into date-based directories"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Photo Import Tool"}
+]
+keywords = ["photo", "exif", "import", "organize", "backup"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics",
+]
+
+dependencies = [
+    "Pillow>=10.0.0",
+    "exifread>=3.0.0",
+]
+
+[project.optional-dependencies]
+heic = [
+    "pillow-heif>=0.13.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.scripts]
+photo-import = "photo_import.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/example/photo-import"
+Repository = "https://github.com/example/photo-import"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["photo_import*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

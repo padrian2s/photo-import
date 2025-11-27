@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+photo_import/__init__.py
+photo_import/cli.py
+photo_import/copier.py
+photo_import/database.py
+photo_import/exif_reader.py
+photo_import/models.py
+photo_import/scanner.py
+photo_import.egg-info/PKG-INFO
+photo_import.egg-info/SOURCES.txt
+photo_import.egg-info/dependency_links.txt
+photo_import.egg-info/entry_points.txt
+photo_import.egg-info/requires.txt
+photo_import.egg-info/top_level.txt

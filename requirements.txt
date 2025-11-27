@@ -1,0 +1,8 @@
+# Photo Import Tool Dependencies
+
+# EXIF reading
+Pillow>=10.0.0
+exifread>=3.0.0
+
+# Optional: For HEIC support (macOS/iOS photos)
+# pillow-heif>=0.13.0

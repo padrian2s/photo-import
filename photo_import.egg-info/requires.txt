@@ -1,0 +1,9 @@
+Pillow>=10.0.0
+exifread>=3.0.0
+
+[dev]
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+[heic]
+pillow-heif>=0.13.0
