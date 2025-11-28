@@ -1,16 +1,15 @@
 """
-Photo copier module - copies photos to date-based directory structure.
+Video copier module - copies videos to date-based directory structure.
 """
 
 import logging
-import re
 import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-from .database import Database
-from .models import BatchStatus, PhotoFile, FileStatus
+from .video_database import VideoDatabase
+from .video_models import VideoBatchStatus, VideoFile, VideoFileStatus
 
 logger = logging.getLogger(__name__)
 
@@ -20,51 +19,50 @@ COMMIT_BATCH_SIZE = 50
 
 def generate_target_path(
     target_base: Path,
-    photo: PhotoFile,
+    video: VideoFile,
     use_file_date_fallback: bool = True,
 ) -> Path:
     """
-    Generate target path based on EXIF date or file creation date.
+    Generate target path based on metadata date or file creation date.
 
     Creates a structure like: target_base/YYYY_MM_DD/filename
 
     Priority:
-    1. EXIF DateTimeOriginal (actual photo creation date)
+    1. Video metadata creation date (from ffprobe)
     2. File creation date (if use_file_date_fallback=True)
     3. File modification date (final fallback)
 
     Args:
-        target_base: Base directory for organized photos
-        photo: PhotoFile record with dates
-        use_file_date_fallback: If True, use file date when no EXIF
+        target_base: Base directory for organized videos
+        video: VideoFile record with dates
+        use_file_date_fallback: If True, use file date when no metadata
 
     Returns:
         Target path (always returns a valid path using file date as fallback)
     """
-    # Prefer EXIF date
-    date = photo.exif_date
+    # Prefer metadata date
+    date = video.metadata_date
 
     # Fall back to file creation date, then modification date
     if date is None and use_file_date_fallback:
-        # Prefer file creation date over modification date
-        date = photo.file_creation_date or photo.file_modification_date
+        date = video.file_creation_date or video.file_modification_date
 
     # Final fallback - should never happen but be safe
     if date is None:
-        date = photo.file_modification_date or datetime.now()
+        date = video.file_modification_date or datetime.now()
 
     # Format: YYYY_MM_DD
     date_folder = date.strftime("%Y_%m_%d")
-    return target_base / date_folder / photo.filename
+    return target_base / date_folder / video.filename
 
 
 def resolve_filename_conflict(target_path: Path) -> Path:
     """
     Resolve filename conflicts by adding a numeric suffix.
 
-    Example: photo.jpg -> photo_1.jpg -> photo_2.jpg
+    Example: video.mp4 -> video_1.mp4 -> video_2.mp4
 
-    Keeps original filename intact (IMG_9994.jpg -> IMG_9994_1.jpg)
+    Keeps original filename intact (VID_20200315.mp4 -> VID_20200315_1.mp4)
     """
     if not target_path.exists():
         return target_path
@@ -73,7 +71,6 @@ def resolve_filename_conflict(target_path: Path) -> Path:
     suffix = target_path.suffix
     parent = target_path.parent
 
-    # Always use original stem, just add counter
     counter = 1
 
     # No limit - just keep incrementing until we find a free slot
@@ -87,28 +84,28 @@ def resolve_filename_conflict(target_path: Path) -> Path:
         counter += 1
 
 
-class PhotoCopier:
-    """Copies photos to organized directory structure."""
+class VideoCopier:
+    """Copies videos to organized directory structure."""
 
     def __init__(
         self,
-        db: Database,
+        db: VideoDatabase,
         use_file_date_fallback: bool = True,
-        skip_no_exif: bool = False,
+        skip_no_metadata: bool = False,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ):
         """
         Initialize the copier.
 
         Args:
-            db: Database instance
-            use_file_date_fallback: Use file date when EXIF not available
-            skip_no_exif: Skip files without EXIF date
+            db: VideoDatabase instance
+            use_file_date_fallback: Use file date when metadata not available
+            skip_no_metadata: Skip files without metadata date
             progress_callback: Optional callback(copied, total, current_file)
         """
         self.db = db
         self.use_file_date_fallback = use_file_date_fallback
-        self.skip_no_exif = skip_no_exif
+        self.skip_no_metadata = skip_no_metadata
         self.progress_callback = progress_callback
 
     def copy(self, batch_id: int, dry_run: bool = False) -> dict:
@@ -126,7 +123,11 @@ class PhotoCopier:
         if not batch:
             raise ValueError(f"Batch {batch_id} not found")
 
-        if batch.status not in (BatchStatus.SCANNED, BatchStatus.COPYING, BatchStatus.PAUSED):
+        # Allow copying if batch is in a copyable state OR if there are pending files
+        # (handles case where batch was marked complete but retry reset files to pending)
+        allowed_statuses = (VideoBatchStatus.SCANNED, VideoBatchStatus.COPYING,
+                           VideoBatchStatus.PAUSED, VideoBatchStatus.COMPLETED)
+        if batch.status not in allowed_statuses:
             raise ValueError(
                 f"Batch {batch_id} is in status {batch.status}, cannot copy"
             )
@@ -134,7 +135,7 @@ class PhotoCopier:
         target_base = Path(batch.target_directory)
 
         # Update batch status to copying
-        self.db.update_batch_status(batch_id, BatchStatus.COPYING)
+        self.db.update_batch_status(batch_id, VideoBatchStatus.COPYING)
 
         stats = {
             'total': 0,
@@ -149,11 +150,11 @@ class PhotoCopier:
             pending_files = self.db.get_pending_files(batch_id)
             stats['total'] = len(pending_files)
 
-            logger.info(f"Starting copy of {stats['total']} files")
+            logger.info(f"Starting copy of {stats['total']} video files")
 
-            for i, photo in enumerate(pending_files):
+            for i, video in enumerate(pending_files):
                 try:
-                    result = self._copy_file(photo, target_base, dry_run)
+                    result = self._copy_file(video, target_base, dry_run)
 
                     if result == 'copied':
                         stats['copied'] += 1
@@ -163,16 +164,16 @@ class PhotoCopier:
                         stats['failed'] += 1
 
                 except Exception as e:
-                    logger.error(f"Error processing {photo.source_path}: {e}")
+                    logger.error(f"Error processing {video.source_path}: {e}")
                     self.db.update_file_status(
-                        photo.id, FileStatus.FAILED, error_message=str(e)
+                        video.id, VideoFileStatus.FAILED, error_message=str(e)
                     )
                     stats['failed'] += 1
 
                 # Progress callback
                 if self.progress_callback:
                     self.progress_callback(
-                        i + 1, stats['total'], photo.source_path
+                        i + 1, stats['total'], video.source_path
                     )
 
                 # Periodic batch count update
@@ -185,19 +186,19 @@ class PhotoCopier:
             # Mark batch as complete if no pending files remain
             remaining = self.db.get_pending_files(batch_id, limit=1)
             if not remaining:
-                self.db.update_batch_status(batch_id, BatchStatus.COMPLETED)
-                logger.info("Batch completed successfully")
+                self.db.update_batch_status(batch_id, VideoBatchStatus.COMPLETED)
+                logger.info("Video batch completed successfully")
             else:
-                logger.info(f"{len(remaining)} files still pending")
+                logger.info(f"{len(remaining)} video files still pending")
 
         except KeyboardInterrupt:
-            logger.info("Copy interrupted by user")
-            self.db.update_batch_status(batch_id, BatchStatus.PAUSED)
+            logger.info("Video copy interrupted by user")
+            self.db.update_batch_status(batch_id, VideoBatchStatus.PAUSED)
             raise
 
         except Exception as e:
-            logger.error(f"Copy failed: {e}")
-            self.db.update_batch_status(batch_id, BatchStatus.PAUSED)
+            logger.error(f"Video copy failed: {e}")
+            self.db.update_batch_status(batch_id, VideoBatchStatus.PAUSED)
             raise
 
         stats['end_time'] = datetime.now()
@@ -207,36 +208,38 @@ class PhotoCopier:
 
     def _copy_file(
         self,
-        photo: PhotoFile,
+        video: VideoFile,
         target_base: Path,
         dry_run: bool,
     ) -> str:
         """
-        Copy a single file.
+        Copy a single video file.
 
         Returns: 'copied', 'skipped', or 'failed'
         """
-        source_path = Path(photo.source_path)
+        source_path = Path(video.source_path)
 
         # Check source exists
         if not source_path.exists():
+            error_msg = f"Source file no longer exists: {source_path}"
+            logger.warning(error_msg)
             self.db.update_file_status(
-                photo.id, FileStatus.FAILED,
+                video.id, VideoFileStatus.FAILED,
                 error_message="Source file no longer exists"
             )
             return 'failed'
 
-        # Skip files without EXIF if requested
-        if self.skip_no_exif and photo.exif_date is None:
+        # Skip files without metadata if requested
+        if self.skip_no_metadata and video.metadata_date is None:
             self.db.update_file_status(
-                photo.id, FileStatus.SKIPPED,
-                error_message="No EXIF date available"
+                video.id, VideoFileStatus.SKIPPED,
+                error_message="No metadata date available"
             )
             return 'skipped'
 
         # Generate target path (uses file creation date as fallback)
         target_path = generate_target_path(
-            target_base, photo, self.use_file_date_fallback
+            target_base, video, self.use_file_date_fallback
         )
 
         # Resolve conflicts
@@ -245,7 +248,7 @@ class PhotoCopier:
         if dry_run:
             logger.info(f"[DRY RUN] Would copy: {source_path} -> {target_path}")
             self.db.update_file_status(
-                photo.id, FileStatus.COPIED,
+                video.id, VideoFileStatus.COPIED,
                 target_path=str(target_path)
             )
             return 'copied'
@@ -259,14 +262,14 @@ class PhotoCopier:
             logger.debug(f"Copied: {source_path} -> {target_path}")
 
             self.db.update_file_status(
-                photo.id, FileStatus.COPIED,
+                video.id, VideoFileStatus.COPIED,
                 target_path=str(target_path)
             )
             return 'copied'
 
         except Exception as e:
             self.db.update_file_status(
-                photo.id, FileStatus.FAILED,
+                video.id, VideoFileStatus.FAILED,
                 error_message=f"Copy failed: {e}"
             )
             return 'failed'
@@ -283,12 +286,12 @@ class PhotoCopier:
         if not batch:
             raise ValueError(f"Batch {batch_id} not found")
 
-        failed_files = self.db.get_files_by_status(batch_id, FileStatus.FAILED)
+        failed_files = self.db.get_files_by_status(batch_id, VideoFileStatus.FAILED)
 
-        for photo in failed_files:
-            self.db.update_file_status(photo.id, FileStatus.PENDING)
+        for video in failed_files:
+            self.db.update_file_status(video.id, VideoFileStatus.PENDING)
 
-        logger.info(f"Reset {len(failed_files)} failed files to pending")
+        logger.info(f"Reset {len(failed_files)} failed video files to pending")
 
         # Re-run copy
         return self.copy(batch_id)
