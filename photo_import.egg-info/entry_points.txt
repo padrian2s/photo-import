@@ -1,2 +1,0 @@
-[console_scripts]
-photo-import = photo_import.cli:main
