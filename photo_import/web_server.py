@@ -1915,11 +1915,13 @@ body {
 
 .file-grid {
     flex: 1;
-    overflow: hidden;
+    overflow-y: auto;
     padding: 1rem;
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-    grid-auto-rows: 1fr;
+    /* Rows follow their content - 1fr would stretch a single row over the
+       whole viewport and squash the tiles once there are many */
+    grid-auto-rows: max-content;
     gap: 0.5rem;
     align-content: start;
     align-items: stretch;
@@ -1960,6 +1962,7 @@ body {
 .file-thumb {
     width: 100%;
     flex: 1;
+    aspect-ratio: 1;
     min-height: 60px;
     object-fit: contain;
     object-position: center;
@@ -1970,6 +1973,7 @@ body {
 .file-icon {
     width: 100%;
     flex: 1;
+    aspect-ratio: 1;
     min-height: 60px;
     display: flex;
     align-items: center;
@@ -1999,6 +2003,7 @@ body {
 .file-grid.list-view .file-thumb,
 .file-grid.list-view .file-icon,
 .file-grid.list-view .video-icon {
+    aspect-ratio: auto;
     width: 48px;
     height: 48px;
     min-height: 48px;
@@ -2129,6 +2134,7 @@ body {
 .video-icon {
     width: 100%;
     flex: 1;
+    aspect-ratio: 1;
     min-height: 60px;
     display: flex;
     align-items: center;
