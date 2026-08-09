@@ -3455,8 +3455,8 @@ treeEl.addEventListener('click', async (e) => {
     // Toggle folder open state
     folder.classList.toggle('open');
 
-    // Navigate to folder (reset to page 1)
-    loadDirectory(path, 1);
+    // Navigate to folder, landing where we left off
+    navigateTo(path);
 
     // Update active state
     document.querySelectorAll('.tree-folder.active').forEach(el => el.classList.remove('active'));
@@ -3464,7 +3464,9 @@ treeEl.addEventListener('click', async (e) => {
 });
 
 // Load directory contents with pagination
-async function loadDirectory(path, page = 1) {
+async function loadDirectory(path, page = 1, restore = null) {
+    rememberDirState();   // so coming back to where we are now lands in the same spot
+
     currentPath = path;
     currentPage = page;
     resetSelection(); // Reset keyboard selection when changing directory
@@ -3495,13 +3497,52 @@ async function loadDirectory(path, page = 1) {
         // Update file count
         updateFileCount(pag);
 
-        // Scroll to top
-        fileGridEl.scrollTop = 0;
+        if (restore) {
+            // Coming back to a folder we have seen before
+            if (restore.selectedIndex >= 0) highlightItem(restore.selectedIndex);
+            fileGridEl.scrollTop = restore.scrollTop || 0;
+        } else {
+            fileGridEl.scrollTop = 0;
+        }
 
     } catch (err) {
         console.error('Failed to load directory:', err);
         fileGridEl.innerHTML = `<div class="error">Failed to load directory</div>`;
     }
+}
+
+// Where we were in each folder we have visited: page, scroll and selection
+const dirState = new Map();
+
+function rememberDirState() {
+    if (!currentPath) return;
+    dirState.set(currentPath, {
+        page: currentPage,
+        scrollTop: fileGridEl.scrollTop,
+        selectedIndex: selectedIndex,
+    });
+}
+
+// Navigate to a folder, landing where we left off if we have been there
+function navigateTo(path) {
+    const saved = dirState.get(path);
+    loadDirectory(path, saved ? saved.page : 1, saved || null);
+}
+
+// Reload the current folder without losing the spot
+function reloadCurrentDirectory() {
+    rememberDirState();
+    navigateTo(currentPath);
+}
+
+// Select an item without scrolling it into view - the caller restores scroll
+function highlightItem(index) {
+    const items = fileGridEl.querySelectorAll('.file-item');
+    if (index < 0 || index >= items.length) return;
+
+    items.forEach(item => item.classList.remove('selected'));
+    selectedIndex = index;
+    items[index].classList.add('selected');
 }
 
 // Update file count display
@@ -3566,7 +3607,7 @@ function renderBreadcrumb(path) {
 breadcrumbEl.addEventListener('click', (e) => {
     if (e.target.tagName === 'A') {
         e.preventDefault();
-        loadDirectory(e.target.dataset.path, 1);
+        navigateTo(e.target.dataset.path);
     }
 });
 
@@ -3711,7 +3752,7 @@ fileGridEl.addEventListener('click', (e) => {
     if (!item || item.classList.contains('missing')) return;
 
     if (item.classList.contains('folder')) {
-        loadDirectory(item.dataset.path, 1);
+        navigateTo(item.dataset.path);
     } else if (item.classList.contains('image') || item.classList.contains('video')) {
         openLightbox(item.dataset.path);
     }
@@ -3897,7 +3938,7 @@ function activateSelectedItem(items) {
 
     const item = items[selectedIndex];
     if (item.classList.contains('folder')) {
-        loadDirectory(item.dataset.path, 1);
+        navigateTo(item.dataset.path);
     } else if (item.classList.contains('image') || item.classList.contains('video')) {
         openLightbox(item.dataset.path);
     }
@@ -3906,7 +3947,7 @@ function activateSelectedItem(items) {
 function goToParentDirectory() {
     if (currentPath === '.') return;
     const parent = currentPath.split('/').slice(0, -1).join('/') || '.';
-    loadDirectory(parent, 1);
+    navigateTo(parent);
 }
 
 // Reset selection when directory changes
@@ -4036,7 +4077,7 @@ function handleTreeKeyNavigation(e) {
                     }
                 }
                 // Navigate to folder (load contents in right panel)
-                loadDirectory(currentFolder.dataset.path, 1);
+                navigateTo(currentFolder.dataset.path);
                 // Update active state
                 document.querySelectorAll('.tree-folder.active').forEach(el => el.classList.remove('active'));
                 currentFolder.classList.add('active');
@@ -4410,7 +4451,7 @@ function refreshBrowseAfterJob() {
     if (currentView === 'browse') {
         loadedTreePaths.clear();
         loadTreeNode('.');
-        loadDirectory(currentPath, currentPage);
+        reloadCurrentDirectory();
     }
 }
 
@@ -4621,12 +4662,12 @@ function openTargetInBrowser(targetPath) {
     const root = serverConfig.root || '';
     if (targetPath === root) {
         setView('browse');
-        loadDirectory('.', 1);
+        navigateTo('.');
         return;
     }
     if (targetPath.startsWith(root + '/')) {
         setView('browse');
-        loadDirectory(targetPath.slice(root.length + 1), 1);
+        navigateTo(targetPath.slice(root.length + 1));
         return;
     }
     alert(`This target is outside the served folder:\\n${targetPath}\\n\\nRestart the server on that folder to browse it.`);
