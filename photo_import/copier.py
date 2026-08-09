@@ -17,6 +17,27 @@ logger = logging.getLogger(__name__)
 # Number of files to process per commit
 COMMIT_BATCH_SIZE = 50
 
+# Imports never land in the bare target - they go under this folder
+ORGANIZED_DIRNAME = "organized_photos"
+
+
+def organized_base(target_base: Path) -> Path:
+    """
+    Return the folder imports are written into.
+
+    Always `target_base/organized_photos`, unless the target already is that
+    folder (so pointing straight at the library does not nest it twice).
+    """
+    target_base = Path(target_base)
+    if target_base.name == ORGANIZED_DIRNAME:
+        return target_base
+    return target_base / ORGANIZED_DIRNAME
+
+
+def date_directory(date: datetime) -> Path:
+    """Hierarchical date folders: 2026-08-09 -> 2026/08/09."""
+    return Path(date.strftime("%Y"), date.strftime("%m"), date.strftime("%d"))
+
 
 def generate_target_path(
     target_base: Path,
@@ -26,7 +47,7 @@ def generate_target_path(
     """
     Generate target path based on EXIF date or file creation date.
 
-    Creates a structure like: target_base/YYYY_MM_DD/filename
+    Creates a structure like: target_base/organized_photos/YYYY/MM/DD/filename
 
     Priority:
     1. EXIF DateTimeOriginal (actual photo creation date)
@@ -53,9 +74,7 @@ def generate_target_path(
     if date is None:
         date = photo.file_modification_date or datetime.now()
 
-    # Format: YYYY_MM_DD
-    date_folder = date.strftime("%Y_%m_%d")
-    return target_base / date_folder / photo.filename
+    return organized_base(target_base) / date_directory(date) / photo.filename
 
 
 def resolve_filename_conflict(target_path: Path) -> Path:
@@ -133,14 +152,16 @@ class PhotoCopier:
 
         target_base = Path(batch.target_directory)
 
-        # Update batch status to copying
-        self.db.update_batch_status(batch_id, BatchStatus.COPYING)
+        # Update batch status to copying (a dry run must not change the batch)
+        if not dry_run:
+            self.db.update_batch_status(batch_id, BatchStatus.COPYING)
 
         stats = {
             'total': 0,
             'copied': 0,
             'skipped': 0,
             'failed': 0,
+            'conflicts': 0,
             'start_time': datetime.now(),
         }
 
@@ -159,6 +180,8 @@ class PhotoCopier:
                         stats['copied'] += 1
                     elif result == 'skipped':
                         stats['skipped'] += 1
+                    elif result == 'conflict':
+                        stats['conflicts'] += 1
                     else:
                         stats['failed'] += 1
 
@@ -176,28 +199,35 @@ class PhotoCopier:
                     )
 
                 # Periodic batch count update
-                if (i + 1) % COMMIT_BATCH_SIZE == 0:
+                if not dry_run and (i + 1) % COMMIT_BATCH_SIZE == 0:
                     self.db.update_batch_counts(batch_id)
 
-            # Final update
-            self.db.update_batch_counts(batch_id)
+            if not dry_run:
+                # Final update
+                self.db.update_batch_counts(batch_id)
 
-            # Mark batch as complete if no pending files remain
-            remaining = self.db.get_pending_files(batch_id, limit=1)
-            if not remaining:
-                self.db.update_batch_status(batch_id, BatchStatus.COMPLETED)
-                logger.info("Batch completed successfully")
-            else:
-                logger.info(f"{len(remaining)} files still pending")
+                # Mark batch as complete if nothing is pending or waiting on a decision
+                remaining = self.db.get_pending_files(batch_id, limit=1)
+                unresolved = self.db.get_files_by_status(batch_id, FileStatus.CONFLICT, limit=1)
+                if not remaining and not unresolved:
+                    self.db.update_batch_status(batch_id, BatchStatus.COMPLETED)
+                    logger.info("Batch completed successfully")
+                elif unresolved:
+                    self.db.update_batch_status(batch_id, BatchStatus.PAUSED)
+                    logger.info(f"{stats['conflicts']} files need a conflict decision")
+                else:
+                    logger.info(f"{len(remaining)} files still pending")
 
         except KeyboardInterrupt:
             logger.info("Copy interrupted by user")
-            self.db.update_batch_status(batch_id, BatchStatus.PAUSED)
+            if not dry_run:
+                self.db.update_batch_status(batch_id, BatchStatus.PAUSED)
             raise
 
         except Exception as e:
             logger.error(f"Copy failed: {e}")
-            self.db.update_batch_status(batch_id, BatchStatus.PAUSED)
+            if not dry_run:
+                self.db.update_batch_status(batch_id, BatchStatus.PAUSED)
             raise
 
         stats['end_time'] = datetime.now()
@@ -239,15 +269,22 @@ class PhotoCopier:
             target_base, photo, self.use_file_date_fallback
         )
 
-        # Resolve conflicts
-        target_path = resolve_filename_conflict(target_path)
+        # Never overwrite silently - park the file until the user decides
+        if target_path.exists():
+            if not dry_run:
+                self.db.update_file_status(
+                    photo.id, FileStatus.CONFLICT,
+                    target_path=str(target_path),
+                    error_message="A different file with this name is already in the library"
+                    if target_path.stat().st_size != photo.file_size
+                    else "The same file is already in the library",
+                )
+            return 'conflict'
 
         if dry_run:
+            # Simulation only - the database is left untouched so the real
+            # copy can still run afterwards
             logger.info(f"[DRY RUN] Would copy: {source_path} -> {target_path}")
-            self.db.update_file_status(
-                photo.id, FileStatus.COPIED,
-                target_path=str(target_path)
-            )
             return 'copied'
 
         # Create target directory
@@ -271,6 +308,84 @@ class PhotoCopier:
             )
             return 'failed'
 
+    def resolve_conflicts(
+        self,
+        batch_id: int,
+        action: str,
+        file_ids: Optional[list] = None,
+    ) -> dict:
+        """
+        Apply the user's decision to files parked as conflicts.
+
+        Args:
+            batch_id: Batch the conflicts belong to
+            action: 'overwrite', 'keep_both' or 'skip'
+            file_ids: Only these files (default: every conflict in the batch)
+
+        Returns:
+            Dictionary with resolution statistics
+        """
+        if action not in ('overwrite', 'keep_both', 'skip'):
+            raise ValueError(f"Unknown conflict action: {action}")
+
+        conflicts = self.db.get_files_by_status(batch_id, FileStatus.CONFLICT)
+        if file_ids:
+            wanted = set(file_ids)
+            conflicts = [photo for photo in conflicts if photo.id in wanted]
+
+        stats = {
+            'total': len(conflicts),
+            'copied': 0,
+            'skipped': 0,
+            'failed': 0,
+            'start_time': datetime.now(),
+        }
+
+        for index, photo in enumerate(conflicts):
+            try:
+                if action == 'skip':
+                    self.db.update_file_status(
+                        photo.id, FileStatus.SKIPPED,
+                        error_message="Kept the file already in the library"
+                    )
+                    stats['skipped'] += 1
+                else:
+                    source_path = Path(photo.source_path)
+                    if not source_path.exists():
+                        raise FileNotFoundError("Source file no longer exists")
+
+                    target_path = Path(photo.target_path)
+                    if action == 'keep_both':
+                        target_path = resolve_filename_conflict(target_path)
+
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_path, target_path)
+                    self.db.update_file_status(
+                        photo.id, FileStatus.COPIED, target_path=str(target_path)
+                    )
+                    stats['copied'] += 1
+
+            except Exception as e:
+                logger.error(f"Failed to resolve conflict for {photo.source_path}: {e}")
+                self.db.update_file_status(
+                    photo.id, FileStatus.FAILED, error_message=f"Conflict resolution failed: {e}"
+                )
+                stats['failed'] += 1
+
+            if self.progress_callback:
+                self.progress_callback(index + 1, stats['total'], photo.source_path)
+
+        self.db.update_batch_counts(batch_id)
+
+        # Close the batch once nothing is pending or waiting on a decision
+        if not self.db.get_pending_files(batch_id, limit=1) and \
+                not self.db.get_files_by_status(batch_id, FileStatus.CONFLICT, limit=1):
+            self.db.update_batch_status(batch_id, BatchStatus.COMPLETED)
+
+        stats['end_time'] = datetime.now()
+        stats['duration'] = stats['end_time'] - stats['start_time']
+        return stats
+
     def retry_failed(self, batch_id: int) -> dict:
         """
         Retry copying failed files.
@@ -289,6 +404,10 @@ class PhotoCopier:
             self.db.update_file_status(photo.id, FileStatus.PENDING)
 
         logger.info(f"Reset {len(failed_files)} failed files to pending")
+
+        # A completed/failed batch would be rejected by copy(), so reopen it
+        if batch.status not in (BatchStatus.SCANNED, BatchStatus.COPYING, BatchStatus.PAUSED):
+            self.db.update_batch_status(batch_id, BatchStatus.PAUSED)
 
         # Re-run copy
         return self.copy(batch_id)

@@ -364,6 +364,7 @@ class Database:
                     SUM(CASE WHEN status = 'copied' THEN 1 ELSE 0 END) as copied,
                     SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
                     SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) as skipped,
+                    SUM(CASE WHEN status = 'conflict' THEN 1 ELSE 0 END) as conflicts,
                     SUM(CASE WHEN exif_date IS NOT NULL THEN 1 ELSE 0 END) as with_exif,
                     SUM(file_size) as total_size
                 FROM photo_files WHERE batch_id = ?

@@ -326,6 +326,7 @@ class VideoDatabase:
                     SUM(CASE WHEN status = 'copied' THEN 1 ELSE 0 END) as copied,
                     SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
                     SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) as skipped,
+                    SUM(CASE WHEN status = 'conflict' THEN 1 ELSE 0 END) as conflicts,
                     SUM(CASE WHEN metadata_date IS NOT NULL THEN 1 ELSE 0 END) as with_metadata,
                     SUM(file_size) as total_size
                 FROM video_files WHERE batch_id = ?

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import __version__
+from .copier import organized_base
 from .database import Database
 from .scanner import PhotoScanner
 from .copier import PhotoCopier
@@ -90,7 +91,7 @@ class CLI:
         print(f"\n📸 Photo Import Tool v{__version__}")
         print("=" * 50)
         print(f"Source: {source_path}")
-        print(f"Target: {target_path}")
+        print(f"Target: {organized_base(target_path)}/YYYY/MM/DD")
         print(f"Checksums: {'disabled' if no_checksum else 'enabled'}")
         print(f"Workers: {num_workers} (parallel threads)")
         print("=" * 50)
@@ -166,7 +167,7 @@ class CLI:
         print(f"Batch: #{batch_id}")
         print(f"Status: {batch.status.value}")
         print(f"Source: {batch.source_directory}")
-        print(f"Target: {batch.target_directory}")
+        print(f"Target: {organized_base(Path(batch.target_directory))}/YYYY/MM/DD")
         print(f"Pending files: {stats['pending']}")
         if dry_run:
             print("Mode: DRY RUN (no files will be copied)")
@@ -337,7 +338,7 @@ class CLI:
         print(f"\n🎬 Video Import Tool v{__version__}")
         print("=" * 50)
         print(f"Source: {source_path}")
-        print(f"Target: {target_path}")
+        print(f"Target: {organized_base(target_path)}/YYYY/MM/DD")
         print(f"Checksums: {'enabled' if not no_checksum else 'disabled (default for videos)'}")
         print(f"Workers: {num_workers} (parallel threads)")
         print("=" * 50)
@@ -412,7 +413,7 @@ class CLI:
         print(f"Batch: #{batch_id}")
         print(f"Status: {batch.status.value}")
         print(f"Source: {batch.source_directory}")
-        print(f"Target: {batch.target_directory}")
+        print(f"Target: {organized_base(Path(batch.target_directory))}/YYYY/MM/DD")
         print(f"Pending files: {stats['pending']}")
         if dry_run:
             print("Mode: DRY RUN (no files will be copied)")
@@ -613,6 +614,10 @@ Examples:
         help='Path to video SQLite database file (default: video_import.db)'
     )
     parser.add_argument(
+        '--favorites-db', default='photo_favorites.db',
+        help='Path to the favorites database used by the web UI (default: photo_favorites.db)'
+    )
+    parser.add_argument(
         '-v', '--verbose', action='store_true',
         help='Enable verbose logging'
     )
@@ -713,6 +718,10 @@ Examples:
     serve_parser.add_argument(
         '--no-browser', action='store_true',
         help='Do not open browser automatically'
+    )
+    serve_parser.add_argument(
+        '--no-import', action='store_true',
+        help='Browse only - hide the scan/copy/retry/expand tools from the UI'
     )
 
     # ===========================================
@@ -823,6 +832,10 @@ Examples:
             port=args.port,
             host=args.host,
             open_browser=not args.no_browser,
+            db_path=args.db,
+            video_db_path=args.video_db,
+            favorites_db_path=args.favorites_db,
+            enable_import=not args.no_import,
         )
     # Video commands
     elif args.command == 'video-scan':
@@ -913,6 +926,10 @@ def serve_photos_cmd(
     port: int = 8080,
     host: str = "127.0.0.1",
     open_browser: bool = True,
+    db_path: str = "photo_import.db",
+    video_db_path: str = "video_import.db",
+    favorites_db_path: str = "photo_favorites.db",
+    enable_import: bool = True,
 ):
     """Start the photo browser web server."""
     from .web_server import run_server
@@ -929,6 +946,10 @@ def serve_photos_cmd(
             port=port,
             host=host,
             open_browser=open_browser,
+            db_path=db_path,
+            video_db_path=video_db_path,
+            favorites_db_path=favorites_db_path,
+            enable_import=enable_import,
         )
     except KeyboardInterrupt:
         pass

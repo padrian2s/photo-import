@@ -14,6 +14,7 @@ class FileStatus(str, Enum):
     COPIED = "copied"        # Successfully copied
     FAILED = "failed"        # Copy failed
     SKIPPED = "skipped"      # Skipped (e.g., no EXIF date)
+    CONFLICT = "conflict"    # Target already exists - waiting for a decision
 
 
 class BatchStatus(str, Enum):
