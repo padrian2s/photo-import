@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "photo-import"
-version = "1.1.0"
+version = "2.0.0"
 description = "A tool to scan photos, extract EXIF dates, organize them into date-based directories, and browse via web UI"
 readme = "README.md"
 license = {text = "MIT"}
