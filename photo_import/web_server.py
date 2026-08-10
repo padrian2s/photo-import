@@ -72,6 +72,8 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
             self.send_favorites()
         elif path == '/api/stats':
             self.send_directory_stats(query)
+        elif path == '/api/all':
+            self.send_recursive_media(query)
         elif path == '/api/conflicts':
             self.send_conflicts(query)
         elif path == '/api/preview':
@@ -657,8 +659,9 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
                     info["size"] = stat.st_size
                     info["is_image"] = ext in IMAGE_EXTENSIONS
                     info["is_video"] = ext in VIDEO_EXTENSIONS
+                    info["is_raw"] = ext in RAW_EXTENSIONS
                     info["favorite"] = relative_path in favorite_paths
-                    if info["is_image"] or info["is_video"]:
+                    if info["is_image"] or info["is_video"] or info["is_raw"]:
                         images.append(info)
                     else:
                         other_files.append(info)
@@ -718,6 +721,67 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
                 "total_dirs": len(dirs),
                 "total_pages": total_pages,
             }
+        })
+
+    def send_recursive_media(self, query: dict):
+        """Every photo/video below a folder, flattened - a year or month at a glance."""
+        relative_path = query.get('path', ['.'])[0] or '.'
+        refresh = query.get('refresh', ['0'])[0] == '1'
+        sort_by = query.get('sort', ['name'])[0]
+        sort_order = query.get('order', ['asc'])[0]
+
+        root = Path(self.root_directory).resolve()
+        target = root if relative_path == '.' else root / relative_path
+
+        if not target.is_dir():
+            self.send_json({"error": "Directory not found"}, 404)
+            return
+
+        cache_key = str(target)
+        entries = None if refresh else RECURSIVE_CACHE.get(cache_key)
+        if entries is None:
+            entries = collect_media_recursive(target, root)
+            # Keep only a few folders cached - these lists can be large
+            while len(RECURSIVE_CACHE) >= 4:
+                RECURSIVE_CACHE.pop(next(iter(RECURSIVE_CACHE)))
+            RECURSIVE_CACHE[cache_key] = entries
+
+        def sort_key(item):
+            if sort_by == 'size':
+                return item['size']
+            if sort_by == 'created':
+                return item['created']
+            if sort_by == 'modified':
+                return item['modified']
+            if sort_by == 'accessed':
+                return item['accessed']
+            return item['path'].lower()
+
+        items = sorted(entries, key=sort_key, reverse=sort_order == 'desc')
+
+        page = max(1, int(query.get('page', ['1'])[0] or 1))
+        per_page = min(int(query.get('per_page', ['50'])[0] or 50), 200)
+        total = len(items)
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        page = min(page, total_pages)
+
+        window = items[(page - 1) * per_page: page * per_page]
+        favorite_paths = self.favorites.all_paths() if self.favorites else set()
+        for item in window:
+            item["favorite"] = item["path"] in favorite_paths
+
+        self.send_json({
+            "path": relative_path,
+            "items": window,
+            "sort": sort_by,
+            "order": sort_order,
+            "pagination": {
+                "page": page,
+                "per_page": per_page,
+                "total_files": total,
+                "total_dirs": 0,
+                "total_pages": total_pages,
+            },
         })
 
     def send_image_list(self, relative_path: str):
@@ -896,6 +960,8 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif', '.bmp', '.tiff', '.tif'}
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v', '.wmv', '.flv', '.3gp', '.mts', '.m2ts'}
+# Photos too, but Pillow cannot render them - listed and counted, never thumbnailed
+RAW_EXTENSIONS = {'.arw', '.orf', '.dng', '.cr2', '.cr3', '.nef', '.rw2', '.pef', '.srw', '.raf', '.raw'}
 
 # Above this, comparing two files byte by byte costs more than it helps
 MAX_COMPARE_BYTES = 512 * 1024 * 1024
@@ -903,11 +969,65 @@ MAX_COMPARE_BYTES = 512 * 1024 * 1024
 
 # Walking a big library is slow, so results are kept until explicitly refreshed
 STATS_CACHE: dict = {}
+RECURSIVE_CACHE: dict = {}
+
+# A guard against pointing the flat view at something enormous
+MAX_RECURSIVE_ITEMS = 200_000
+
+
+def collect_media_recursive(directory: Path, root: Path) -> list:
+    """Every photo/video under a directory, as flat listing entries."""
+    entries = []
+    stack = [directory]
+
+    while stack and len(entries) < MAX_RECURSIVE_ITEMS:
+        current = stack.pop()
+        try:
+            children = list(os.scandir(current))
+        except (PermissionError, OSError):
+            continue
+
+        for child in children:
+            if child.name.startswith('.'):
+                continue
+            try:
+                if child.is_dir(follow_symlinks=False):
+                    stack.append(Path(child.path))
+                    continue
+                if not child.is_file(follow_symlinks=False):
+                    continue
+
+                extension = Path(child.name).suffix.lower()
+                is_image = extension in IMAGE_EXTENSIONS
+                is_video = extension in VIDEO_EXTENSIONS
+                is_raw = extension in RAW_EXTENSIONS
+                if not (is_image or is_video or is_raw):
+                    continue
+
+                stat = child.stat(follow_symlinks=False)
+                entries.append({
+                    "name": child.name,
+                    "path": str(Path(child.path).relative_to(root)),
+                    "folder": str(Path(child.path).parent.relative_to(root)),
+                    "is_dir": False,
+                    "extension": extension,
+                    "size": stat.st_size,
+                    "is_image": is_image,
+                    "is_video": is_video,
+                    "is_raw": is_raw,
+                    "modified": stat.st_mtime,
+                    "accessed": stat.st_atime,
+                    "created": getattr(stat, 'st_birthtime', stat.st_ctime),
+                })
+            except OSError:
+                continue
+
+    return entries
 
 
 def scan_tree(directory: Path) -> dict:
     """Total size and file counts under a directory, by kind."""
-    totals = {"files": 0, "images": 0, "videos": 0, "other": 0, "bytes": 0}
+    totals = {"files": 0, "images": 0, "videos": 0, "raw": 0, "other": 0, "bytes": 0}
     stack = [directory]
 
     while stack:
@@ -934,6 +1054,8 @@ def scan_tree(directory: Path) -> dict:
                     totals["images"] += 1
                 elif extension in VIDEO_EXTENSIONS:
                     totals["videos"] += 1
+                elif extension in RAW_EXTENSIONS:
+                    totals["raw"] += 1
                 else:
                     totals["other"] += 1
             except OSError:
@@ -945,7 +1067,7 @@ def scan_tree(directory: Path) -> dict:
 def collect_directory_stats(target: Path, root: Path) -> dict:
     """Per-subfolder totals plus the files sitting directly in this folder."""
     rows = []
-    loose = {"files": 0, "images": 0, "videos": 0, "other": 0, "bytes": 0}
+    loose = {"files": 0, "images": 0, "videos": 0, "raw": 0, "other": 0, "bytes": 0}
 
     try:
         entries = sorted(os.scandir(target), key=lambda e: e.name.lower())
@@ -969,6 +1091,8 @@ def collect_directory_stats(target: Path, root: Path) -> dict:
                     loose["images"] += 1
                 elif extension in VIDEO_EXTENSIONS:
                     loose["videos"] += 1
+                elif extension in RAW_EXTENSIONS:
+                    loose["raw"] += 1
                 else:
                     loose["other"] += 1
         except OSError:
@@ -976,7 +1100,7 @@ def collect_directory_stats(target: Path, root: Path) -> dict:
 
     totals = {
         key: sum(row[key] for row in rows) + loose[key]
-        for key in ("files", "images", "videos", "other", "bytes")
+        for key in ("files", "images", "videos", "raw", "other", "bytes")
     }
 
     relative = '.' if target == root else str(target.relative_to(root))
@@ -1240,6 +1364,7 @@ def get_index_html() -> str:
                         <input type="text" class="filter-input" id="filter-input" placeholder="Filter..." title="Filter files (F)">
                     </span>
                     <button class="btn" id="btn-clear-filter" title="Clear filter (Esc)" style="display:none;">&times;</button>
+                    <button class="btn" id="btn-recursive" title="Show every photo below this folder (V)" data-shortcut="V">All photos</button>
                     <button class="btn import-only" id="btn-import-here" title="Import from this folder">Import this folder</button>
                     <button class="btn" id="btn-help" title="Show shortcuts (?)" data-shortcut="?">?</button>
                     <span class="file-count" id="file-count"></span>
@@ -1496,6 +1621,7 @@ def get_index_html() -> str:
                     <div class="help-section">
                         <h3>Other</h3>
                         <div class="help-row"><kbd>F</kbd> Focus filter</div>
+                        <div class="help-row"><kbd>V</kbd> All photos below folder</div>
                         <div class="help-row"><kbd>*</kbd> Favorite selected item</div>
                         <div class="help-row"><kbd>Esc</kbd> Clear filter / Close</div>
                         <div class="help-row"><kbd>?</kbd> Toggle this help</div>
@@ -1981,6 +2107,40 @@ body {
     font-size: 3rem;
     background: #0f3460;
     color: #4db5ff;
+}
+
+.raw-icon {
+    width: 100%;
+    flex: 1;
+    aspect-ratio: 1;
+    min-height: 60px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(135deg, #16213e 0%, #0f3460 100%);
+    color: #8a93a8;
+    font-size: 0.95rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+}
+
+.file-grid.list-view .raw-icon {
+    aspect-ratio: auto;
+    width: 48px;
+    height: 48px;
+    min-height: 48px;
+    font-size: 0.65rem;
+    flex-shrink: 0;
+}
+
+.file-sub {
+    padding: 0 0.5rem 0.3rem;
+    font-size: 0.68rem;
+    color: #8a93a8;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex-shrink: 0;
 }
 
 .file-name {
@@ -3120,6 +3280,7 @@ let conflictContext = null;   // {media, batchId}
 let conflictPage = 1;
 let storagePath = '.';
 let storageParent = null;
+let recursiveMode = false;   // V: every photo below the current folder
 
 // DOM Elements
 const treeEl = document.getElementById('tree');
@@ -3152,6 +3313,7 @@ document.addEventListener('DOMContentLoaded', () => {
     loadTreeNode('.'); // Load root only
     loadDirectory('.', 1);
 
+    document.getElementById('btn-recursive').addEventListener('click', () => toggleRecursive());
     document.getElementById('btn-grid').addEventListener('click', () => setViewMode('grid'));
     document.getElementById('btn-list').addEventListener('click', () => setViewMode('list'));
     document.getElementById('lightbox-close').addEventListener('click', closeLightbox);
@@ -3256,7 +3418,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             return;
         }
-        if ((e.key === '?' || (e.shiftKey && e.key === '/')) && !e.target.closest('input, select, textarea')) {
+        if ((e.key === '?' || (e.shiftKey && e.key === '/')) && !isTypingTarget(e.target)) {
             e.preventDefault();
             toggleShortcuts();
             return;
@@ -3271,7 +3433,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         if (currentView !== 'browse' && currentView !== 'favorites') return;
-        if (e.target.closest('input, select, textarea')) return;
+        if (isTypingTarget(e.target)) return;
 
         // Star favorites the selected item in either grid
         if (e.key === '*') {
@@ -3359,6 +3521,11 @@ document.addEventListener('DOMContentLoaded', () => {
         if (key === 'o') {
             e.preventDefault();
             toggleSortOrder();
+            return;
+        }
+        if (key === 'v') {
+            e.preventDefault();
+            toggleRecursive();
             return;
         }
 
@@ -3474,7 +3641,8 @@ async function loadDirectory(path, page = 1, restore = null) {
     paginationEl.innerHTML = '';
 
     try {
-        const res = await fetch(`/api/list?path=${encodeURIComponent(path)}&page=${page}&per_page=${perPage}&sort=${sortBy}&order=${sortOrder}`);
+        const endpoint = recursiveMode ? '/api/all' : '/api/list';
+        const res = await fetch(`${endpoint}?path=${encodeURIComponent(path)}&page=${page}&per_page=${perPage}&sort=${sortBy}&order=${sortOrder}`);
         const data = await res.json();
 
         if (data.error) {
@@ -3511,11 +3679,35 @@ async function loadDirectory(path, page = 1, restore = null) {
     }
 }
 
+// Key events can land on the document itself, which has no closest()
+function isTypingTarget(target) {
+    return !!(target && typeof target.closest === 'function' && target.closest('input, select, textarea'));
+}
+
+// V: flatten everything below the current folder into one thumbnail grid
+function toggleRecursive(force) {
+    const wanted = force === undefined ? !recursiveMode : force;
+    if (wanted === recursiveMode) return;
+
+    if (wanted) rememberDirState();   // keep the folder's own spot for the way back
+    recursiveMode = wanted;
+    document.getElementById('btn-recursive').classList.toggle('active', recursiveMode);
+    contentEl.classList.toggle('recursive', recursiveMode);
+
+    // Leaving the flat view returns to where we were in the folder itself
+    if (recursiveMode) {
+        loadDirectory(currentPath, 1);
+    } else {
+        const saved = dirState.get(currentPath);
+        loadDirectory(currentPath, saved ? saved.page : 1, saved || null);
+    }
+}
+
 // Where we were in each folder we have visited: page, scroll and selection
 const dirState = new Map();
 
 function rememberDirState() {
-    if (!currentPath) return;
+    if (!currentPath || recursiveMode) return;
     dirState.set(currentPath, {
         page: currentPage,
         scrollTop: fileGridEl.scrollTop,
@@ -3525,6 +3717,11 @@ function rememberDirState() {
 
 // Navigate to a folder, landing where we left off if we have been there
 function navigateTo(path) {
+    if (recursiveMode) {
+        recursiveMode = false;
+        document.getElementById('btn-recursive').classList.remove('active');
+        contentEl.classList.remove('recursive');
+    }
     const saved = dirState.get(path);
     loadDirectory(path, saved ? saved.page : 1, saved || null);
 }
@@ -3547,6 +3744,15 @@ function highlightItem(index) {
 
 // Update file count display
 function updateFileCount(pag) {
+    if (recursiveMode) {
+        const total = pag ? pag.total_files : allItems.length;
+        const where = currentPath === '.' ? 'the library' : currentPath;
+        fileCountEl.textContent = filterText
+            ? `Filter: ${getFilteredItems().length} matches`
+            : `All photos below ${where}: ${total.toLocaleString()}`;
+        return;
+    }
+
     const dirCount = pag ? pag.total_dirs : allItems.filter(i => i.is_dir).length;
     const fileCount = pag ? pag.total_files : allItems.filter(i => !i.is_dir).length;
     const showingStart = pag ? (pag.page - 1) * pag.per_page + 1 : 1;
@@ -3710,6 +3916,11 @@ function renderFileItem(item) {
                   >${item.favorite ? '\\u2605' : '\\u2606'}</button>`;
     const missing = item.missing ? ' missing' : '';
 
+    // In the flat view a tile also says which folder it came from
+    const sub = item.folder && item.folder !== currentPath
+        ? `<div class="file-sub">${escapeHtml(item.folder)}</div>`
+        : '';
+
     if (item.is_image) {
         const thumb = item.missing
             ? '<div class="file-icon">&#10071;</div>'
@@ -3717,7 +3928,7 @@ function renderFileItem(item) {
         return `
             <div class="file-item image${missing}" data-path="${path}">
                 ${thumb}${star}
-                <div class="file-name">${name}</div>
+                <div class="file-name">${name}</div>${sub}
             </div>
         `;
     }
@@ -3726,7 +3937,17 @@ function renderFileItem(item) {
         return `
             <div class="file-item video${missing}" data-path="${path}">
                 <div class="video-icon">&#9658;</div>${star}
-                <div class="file-name">${name}</div>
+                <div class="file-name">${name}</div>${sub}
+            </div>
+        `;
+    }
+
+    if (item.is_raw) {
+        const kind = (item.extension || '').replace('.', '').toUpperCase();
+        return `
+            <div class="file-item raw${missing}" data-path="${path}">
+                <div class="raw-icon">${escapeHtml(kind || 'RAW')}</div>${star}
+                <div class="file-name">${name}</div>${sub}
             </div>
         `;
     }
@@ -4794,6 +5015,7 @@ function renderStorage(data) {
     document.getElementById('storage-summary').innerHTML = `
         <span>Total size<b>${formatGB(totals.bytes)}</b></span>
         <span>Photos<b>${totals.images.toLocaleString()}</b></span>
+        <span>RAW<b>${(totals.raw || 0).toLocaleString()}</b></span>
         <span>Videos<b>${totals.videos.toLocaleString()}</b></span>
         <span>Other files<b>${totals.other.toLocaleString()}</b></span>
         <span>Folders<b>${data.rows.length}</b></span>
@@ -4811,6 +5033,7 @@ function renderStorage(data) {
         <tr>
             <td><span class="folder-link" data-storage-path="${escapeHtml(row.path)}">${escapeHtml(row.name)}</span></td>
             <td class="num">${row.images.toLocaleString()}</td>
+            <td class="num">${(row.raw || 0).toLocaleString()}</td>
             <td class="num">${row.videos.toLocaleString()}</td>
             <td class="num">${row.other.toLocaleString()}</td>
             <td class="num">${formatGB(row.bytes)}</td>
@@ -4822,6 +5045,7 @@ function renderStorage(data) {
         <tr>
             <td><em>files in this folder</em></td>
             <td class="num">${data.loose.images.toLocaleString()}</td>
+            <td class="num">${(data.loose.raw || 0).toLocaleString()}</td>
             <td class="num">${data.loose.videos.toLocaleString()}</td>
             <td class="num">${data.loose.other.toLocaleString()}</td>
             <td class="num">${formatGB(data.loose.bytes)}</td>
@@ -4832,7 +5056,7 @@ function renderStorage(data) {
         <table class="storage-table">
             <thead>
                 <tr>
-                    <th>Folder</th><th>Photos</th><th>Videos</th><th>Other</th><th>Size</th><th style="width:25%"></th>
+                    <th>Folder</th><th>Photos</th><th>RAW</th><th>Videos</th><th>Other</th><th>Size</th><th style="width:25%"></th>
                 </tr>
             </thead>
             <tbody>${rows}${loose}</tbody>
@@ -4840,6 +5064,7 @@ function renderStorage(data) {
                 <tr>
                     <td>Total</td>
                     <td class="num">${totals.images.toLocaleString()}</td>
+                    <td class="num">${(totals.raw || 0).toLocaleString()}</td>
                     <td class="num">${totals.videos.toLocaleString()}</td>
                     <td class="num">${totals.other.toLocaleString()}</td>
                     <td class="num">${formatGB(totals.bytes)}</td>

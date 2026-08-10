@@ -90,7 +90,7 @@ Tabs in the UI:
 
 | Tab | CLI equivalent |
 |-----|----------------|
-| **Browse** | browse the served folder, thumbnails, lightbox, keyboard navigation, favorites |
+| **Browse** | browse the served folder, thumbnails, lightbox, keyboard navigation, favorites, and **V** for every photo below the current folder |
 | **Favorites** | every starred photo/video in one grid |
 | **Storage** | size in GB and photo/video counts per folder - per year inside the library - with drill-down |
 | **Import** | `scan` / `video-scan`, plus a shortcut for `copy` / `video-copy` of the latest batch |
@@ -105,6 +105,8 @@ Notes:
 - The line under the target field spells out the exact destination (`.../organized_photos/YYYY/MM/DD/`) before anything is copied.
 - Under the source field, **Mounted volumes** lists what is plugged in (`/Volumes`, `/media`, `/mnt`), plus the served folder (★) and the home folder; one click fills in the source. The ↻ button rescans after plugging in a card.
 - The server uses the databases passed to the command: `photo-import --db my.db --video-db my_video.db serve ...`.
+- **V** flattens a year, month or day into one thumbnail grid - every photo below it, paginated, with the folder printed under each tile. Press **V** again (or walk to another folder) to go back to the normal listing.
+- RAW files (`.arw`, `.orf`, `.cr2`, `.nef`, `.dng`, ...) are listed and counted as photos, shown with a RAW tile instead of a thumbnail - Pillow cannot render them.
 - **Storage** measures every subfolder of the one you are looking at, so opening it on `organized_photos` gives the per-year breakdown. Results are cached until you press **Rescan**.
 - Favorites are stored in `photo_favorites.db` (`--favorites-db` to move it), keyed by the path inside the served folder. Star a file from the grid, from the lightbox, or with the **F** key; **Clean up missing** forgets favorites whose file is gone. They work in `--no-import` mode too.
 - The import tools read and write anywhere on the machine. They are meant for a server bound to localhost (the default); use `--no-import` to serve a browse-only UI.
