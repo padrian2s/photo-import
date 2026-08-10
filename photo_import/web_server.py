@@ -1589,6 +1589,24 @@ def get_index_html() -> str:
             </div>
         </div>
 
+        <!-- Size of the selected folder (S) -->
+        <div class="modal" id="size-modal">
+            <div class="modal-box size-box">
+                <div class="modal-head">
+                    <h3 id="size-title">Folder size</h3>
+                    <button class="btn" id="size-close">&times;</button>
+                </div>
+                <div class="modal-path" id="size-path"></div>
+                <div class="storage-summary" id="size-summary"></div>
+                <div class="modal-list" id="size-table"></div>
+                <div class="modal-actions">
+                    <button class="btn" id="size-up">Up</button>
+                    <button class="btn" id="size-rescan">Rescan</button>
+                    <button class="btn primary" id="size-open">Open in Storage</button>
+                </div>
+            </div>
+        </div>
+
         <!-- Help overlay -->
         <div class="help-overlay" id="help-overlay">
             <div class="help-content">
@@ -1622,6 +1640,7 @@ def get_index_html() -> str:
                         <h3>Other</h3>
                         <div class="help-row"><kbd>F</kbd> Focus filter</div>
                         <div class="help-row"><kbd>V</kbd> All photos below folder</div>
+                        <div class="help-row"><kbd>S</kbd> Size of selected folder</div>
                         <div class="help-row"><kbd>*</kbd> Favorite selected item</div>
                         <div class="help-row"><kbd>Esc</kbd> Clear filter / Close</div>
                         <div class="help-row"><kbd>?</kbd> Toggle this help</div>
@@ -3127,6 +3146,18 @@ body {
     justify-content: flex-end;
 }
 
+.size-box {
+    width: min(760px, 94vw);
+}
+
+.size-box .modal-list {
+    padding: 0.25rem 0.5rem;
+}
+
+.size-box .storage-summary {
+    margin-bottom: 0.5rem;
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar {
     width: 8px;
@@ -3281,6 +3312,8 @@ let conflictPage = 1;
 let storagePath = '.';
 let storageParent = null;
 let recursiveMode = false;   // V: every photo below the current folder
+let sizePath = '.';          // folder shown in the size dialog
+let sizeParent = null;
 
 // DOM Elements
 const treeEl = document.getElementById('tree');
@@ -3305,6 +3338,7 @@ const favoritesGridEl = document.getElementById('favorites-grid');
 const lightboxFavEl = document.getElementById('lightbox-fav');
 const volumeListEl = document.getElementById('volume-list');
 const dirModalEl = document.getElementById('dir-modal');
+const sizeModalEl = document.getElementById('size-modal');
 const dirListEl = document.getElementById('dir-list');
 const dirPathEl = document.getElementById('dir-path');
 
@@ -3322,6 +3356,25 @@ document.addEventListener('DOMContentLoaded', () => {
     lightboxFavEl.addEventListener('click', (e) => {
         e.stopPropagation();
         toggleFavorite(currentMediaPath);
+    });
+
+    // Size dialog
+    document.getElementById('size-close').addEventListener('click', closeSizeDialog);
+    document.getElementById('size-rescan').addEventListener('click', () => loadSizeDialog(true));
+    document.getElementById('size-up').addEventListener('click', () => {
+        if (sizeParent) openSizeDialog(sizeParent);
+    });
+    document.getElementById('size-open').addEventListener('click', () => {
+        closeSizeDialog();
+        setView('storage');
+        loadStorage(sizePath);
+    });
+    document.getElementById('size-table').addEventListener('click', (e) => {
+        const link = e.target.closest('[data-size-path]');
+        if (link) openSizeDialog(link.dataset.sizePath);
+    });
+    sizeModalEl.addEventListener('click', (e) => {
+        if (e.target === sizeModalEl) closeSizeDialog();
     });
 
     // Favorites view
@@ -3406,6 +3459,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (dirModalEl.classList.contains('active')) {
             if (e.key === 'Escape') closeDirPicker();
+            return;
+        }
+
+        if (sizeModalEl.classList.contains('active')) {
+            if (e.key === 'Escape' || e.key === 's' || e.key === 'S') closeSizeDialog();
             return;
         }
 
@@ -3526,6 +3584,11 @@ document.addEventListener('DOMContentLoaded', () => {
         if (key === 'v') {
             e.preventDefault();
             toggleRecursive();
+            return;
+        }
+        if (key === 's') {
+            e.preventDefault();
+            toggleSizeDialog();
             return;
         }
 
@@ -5071,6 +5134,103 @@ function renderStorage(data) {
                     <td></td>
                 </tr>
             </tfoot>
+        </table>
+    `;
+}
+
+// ---------------------------------------------------------------------------
+// S - size of whatever is selected in the hierarchy, without leaving Browse
+// ---------------------------------------------------------------------------
+
+// Whatever the user would call "selected": tree focus, then grid folder, then here
+function selectedHierarchyPath() {
+    if (focusedPanel === 'tree') {
+        const treeFolder = treeEl.querySelector('.tree-folder.focused')
+            || treeEl.querySelector('.tree-folder.active');
+        if (treeFolder) return treeFolder.dataset.path;
+    }
+
+    const grid = currentView === 'favorites' ? favoritesGridEl : fileGridEl;
+    const selected = grid.querySelectorAll('.file-item')[selectedIndex];
+    if (selected && selected.classList.contains('folder')) return selected.dataset.path;
+
+    return currentPath;
+}
+
+function toggleSizeDialog() {
+    if (sizeModalEl.classList.contains('active')) {
+        closeSizeDialog();
+    } else {
+        openSizeDialog(selectedHierarchyPath());
+    }
+}
+
+function openSizeDialog(path, refresh) {
+    sizePath = path || '.';
+    sizeModalEl.classList.add('active');
+    loadSizeDialog(refresh);
+}
+
+function closeSizeDialog() {
+    sizeModalEl.classList.remove('active');
+}
+
+async function loadSizeDialog(refresh) {
+    const name = sizePath === '.' ? (serverConfig.root || 'Library').split('/').pop() : sizePath.split('/').pop();
+    document.getElementById('size-title').textContent = `Size of ${name}`;
+    document.getElementById('size-path').textContent =
+        sizePath === '.' ? (serverConfig.root || '') : `${serverConfig.root || ''}/${sizePath}`;
+    document.getElementById('size-summary').innerHTML = '';
+    document.getElementById('size-table').innerHTML =
+        '<div class="loading-indicator">Measuring...</div>';
+
+    try {
+        const query = `path=${encodeURIComponent(sizePath)}${refresh ? '&refresh=1' : ''}`;
+        const data = await api('GET', `/api/stats?${query}`);
+        sizeParent = data.parent;
+        renderSizeDialog(data);
+    } catch (err) {
+        document.getElementById('size-table').innerHTML =
+            `<div class="form-error">${escapeHtml(err.message)}</div>`;
+    }
+}
+
+function renderSizeDialog(data) {
+    const totals = data.totals;
+    document.getElementById('size-summary').innerHTML = `
+        <span>Total size<b>${formatGB(totals.bytes)}</b></span>
+        <span>Photos<b>${totals.images.toLocaleString()}</b></span>
+        <span>RAW<b>${(totals.raw || 0).toLocaleString()}</b></span>
+        <span>Videos<b>${totals.videos.toLocaleString()}</b></span>
+        <span>Folders<b>${data.rows.length}</b></span>
+    `;
+
+    document.getElementById('size-up').disabled = !data.parent;
+
+    if (data.rows.length === 0) {
+        document.getElementById('size-table').innerHTML =
+            '<div class="card-hint" style="padding:0.6rem">No subfolders - the totals above cover this folder.</div>';
+        return;
+    }
+
+    const biggest = Math.max(1, ...data.rows.map(r => r.bytes));
+    document.getElementById('size-table').innerHTML = `
+        <table class="storage-table">
+            <thead>
+                <tr><th>Folder</th><th>Photos</th><th>RAW</th><th>Videos</th><th>Size</th><th style="width:20%"></th></tr>
+            </thead>
+            <tbody>
+                ${data.rows.map(row => `
+                    <tr>
+                        <td><span class="folder-link" data-size-path="${escapeHtml(row.path)}">${escapeHtml(row.name)}</span></td>
+                        <td class="num">${row.images.toLocaleString()}</td>
+                        <td class="num">${(row.raw || 0).toLocaleString()}</td>
+                        <td class="num">${row.videos.toLocaleString()}</td>
+                        <td class="num">${formatGB(row.bytes)}</td>
+                        <td><div class="storage-bar" style="width: ${Math.round(100 * row.bytes / biggest)}%"></div></td>
+                    </tr>
+                `).join('')}
+            </tbody>
         </table>
     `;
 }

@@ -105,6 +105,7 @@ Notes:
 - The line under the target field spells out the exact destination (`.../organized_photos/YYYY/MM/DD/`) before anything is copied.
 - Under the source field, **Mounted volumes** lists what is plugged in (`/Volumes`, `/media`, `/mnt`), plus the served folder (★) and the home folder; one click fills in the source. The ↻ button rescans after plugging in a card.
 - The server uses the databases passed to the command: `photo-import --db my.db --video-db my_video.db serve ...`.
+- **S** opens a size dialog for whatever is selected in the hierarchy - the folder focused in the tree, otherwise the folder tile selected in the grid, otherwise the folder you are in. It shows the total size, photo/RAW/video counts and a per-subfolder table you can drill into; **Open in Storage** hands it over to the full view.
 - **V** flattens a year, month or day into one thumbnail grid - every photo below it, paginated, with the folder printed under each tile. Press **V** again (or walk to another folder) to go back to the normal listing.
 - RAW files (`.arw`, `.orf`, `.cr2`, `.nef`, `.dng`, ...) are listed and counted as photos, shown with a RAW tile instead of a thumbnail - Pillow cannot render them.
 - **Storage** measures every subfolder of the one you are looking at, so opening it on `organized_photos` gives the per-year breakdown. Results are cached until you press **Rescan**.
