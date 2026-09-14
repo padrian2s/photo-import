@@ -314,6 +314,20 @@ class Database:
 
         return [self._row_to_photo_file(row) for row in rows]
 
+    def get_imported_files(self, batch_id: int) -> List[dict]:
+        """Where a batch's files ended up - one row per file it actually copied."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT target_path, file_size
+                FROM photo_files
+                WHERE batch_id = ? AND status = ? AND target_path IS NOT NULL
+                """,
+                (batch_id, FileStatus.COPIED.value)
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
     def update_file_status(
         self,
         file_id: int,

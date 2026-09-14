@@ -74,6 +74,10 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
             self.send_directory_stats(query)
         elif path == '/api/all':
             self.send_recursive_media(query)
+        elif path == '/api/batch-index':
+            self.send_batch_index(query)
+        elif path == '/api/batch-media':
+            self.send_batch_media(query)
         elif path == '/api/conflicts':
             self.send_conflicts(query)
         elif path == '/api/preview':
@@ -784,6 +788,141 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
             },
         })
 
+    def send_batch_index(self, query: dict):
+        """Every import that put files in the library, newest first.
+
+        Photos and videos in one list so the Browse picker can offer them by
+        date - a batch is identified by its media type plus its id.
+        """
+        limit = min(int(query.get('limit', ['50'])[0] or 50), 200)
+
+        if self.job_manager is None:
+            self.send_json({"batches": [], "import_enabled": False})
+            return
+
+        root = Path(self.root_directory).resolve()
+        batches = []
+
+        for media in (PHOTO, VIDEO):
+            db = self.job_manager.database_for(media)
+            for batch in db.list_batches(limit=limit):
+                stats = db.get_batch_stats(batch.id)
+                copied = stats.get('copied') or 0
+                if not copied:
+                    continue  # nothing was imported, so there is nothing to browse
+
+                imported_at = (
+                    batch.completed_at or batch.copy_started_at or batch.started_at
+                )
+                # The files sit under the target, but a server started on
+                # .../organized_photos is deeper than the target it was given -
+                # either way there is something to show.
+                target = Path(batch.target_directory)
+                in_root = (
+                    target == root or root in target.parents or target in root.parents
+                )
+                batches.append({
+                    "id": batch.id,
+                    "media": media,
+                    "status": batch.status.value,
+                    "copied": copied,
+                    "source_directory": batch.source_directory,
+                    "target_directory": batch.target_directory,
+                    "imported_at": imported_at.isoformat(timespec='seconds') if imported_at else None,
+                    "in_root": in_root,
+                })
+
+        batches.sort(key=lambda item: item["imported_at"] or "", reverse=True)
+        self.send_json({"batches": batches, "import_enabled": True})
+
+    def send_batch_media(self, query: dict):
+        """The files one import put in the library, flattened into one grid."""
+        media = query.get('media', [PHOTO])[0]
+        raw_id = query.get('id', [None])[0]
+        refresh = query.get('refresh', ['0'])[0] == '1'
+        sort_by = query.get('sort', ['name'])[0]
+        sort_order = query.get('order', ['asc'])[0]
+
+        if self.job_manager is None:
+            self.send_json({"error": "Import operations are disabled"}, 503)
+            return
+
+        if raw_id is None:
+            self.send_json({"error": "Missing batch id"}, 400)
+            return
+
+        try:
+            db = self.job_manager.database_for(media)
+            batch_id = int(raw_id)
+        except ValueError as exc:
+            self.send_json({"error": f"Invalid batch: {exc}"}, 400)
+            return
+
+        batch = db.get_batch(batch_id)
+        if not batch:
+            self.send_json({"error": f"Batch {batch_id} not found"}, 404)
+            return
+
+        root = Path(self.root_directory).resolve()
+        cache_key = f"{media}:{batch_id}"
+        collected = None if refresh else BATCH_CACHE.get(cache_key)
+        if collected is None:
+            collected = collect_batch_media(db.get_imported_files(batch_id), root)
+            while len(BATCH_CACHE) >= 4:
+                BATCH_CACHE.pop(next(iter(BATCH_CACHE)))
+            BATCH_CACHE[cache_key] = collected
+
+        entries = collected["entries"]
+
+        def sort_key(item):
+            if sort_by == 'size':
+                return item['size']
+            if sort_by == 'created':
+                return item['created']
+            if sort_by == 'modified':
+                return item['modified']
+            if sort_by == 'accessed':
+                return item['accessed']
+            return item['path'].lower()
+
+        items = sorted(entries, key=sort_key, reverse=sort_order == 'desc')
+
+        page = max(1, int(query.get('page', ['1'])[0] or 1))
+        per_page = min(int(query.get('per_page', ['50'])[0] or 50), 200)
+        total = len(items)
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        page = min(page, total_pages)
+
+        window = items[(page - 1) * per_page: page * per_page]
+        favorite_paths = self.favorites.all_paths() if self.favorites else set()
+        for item in window:
+            item["favorite"] = item["path"] in favorite_paths
+
+        imported_at = batch.completed_at or batch.copy_started_at or batch.started_at
+        self.send_json({
+            "batch": {
+                "id": batch.id,
+                "media": media,
+                "status": batch.status.value,
+                "source_directory": batch.source_directory,
+                "target_directory": batch.target_directory,
+                "imported_at": imported_at.isoformat(timespec='seconds') if imported_at else None,
+                "shown": total,
+                "outside": collected["outside"],
+                "missing": collected["missing"],
+            },
+            "items": window,
+            "sort": sort_by,
+            "order": sort_order,
+            "pagination": {
+                "page": page,
+                "per_page": per_page,
+                "total_files": total,
+                "total_dirs": 0,
+                "total_pages": total_pages,
+            },
+        })
+
     def send_image_list(self, relative_path: str):
         """Send list of images in a directory."""
         images = list_images_in_directory(self.root_directory, relative_path)
@@ -970,6 +1109,7 @@ MAX_COMPARE_BYTES = 512 * 1024 * 1024
 # Walking a big library is slow, so results are kept until explicitly refreshed
 STATS_CACHE: dict = {}
 RECURSIVE_CACHE: dict = {}
+BATCH_CACHE: dict = {}
 
 # A guard against pointing the flat view at something enormous
 MAX_RECURSIVE_ITEMS = 200_000
@@ -1023,6 +1163,65 @@ def collect_media_recursive(directory: Path, root: Path) -> list:
                 continue
 
     return entries
+
+
+def collect_batch_media(records: list, root: Path) -> dict:
+    """Turn a batch's copied files into listing entries, as the grid wants them.
+
+    A batch spreads its files over many date folders, so the result is flat -
+    the same shape the recursive view uses. Files that landed outside the
+    served folder cannot be shown here; files deleted since the import are
+    kept, flagged as missing.
+    """
+    entries = []
+    outside = 0
+    missing = 0
+
+    for record in records:
+        target = record.get("target_path")
+        if not target:
+            continue
+
+        path = Path(target)
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            try:
+                relative = path.resolve().relative_to(root)
+            except (ValueError, OSError):
+                outside += 1
+                continue
+
+        extension = path.suffix.lower()
+        entry = {
+            "name": path.name,
+            "path": str(relative),
+            "folder": str(relative.parent),
+            "is_dir": False,
+            "extension": extension,
+            "size": record.get("file_size") or 0,
+            "is_image": extension in IMAGE_EXTENSIONS,
+            "is_video": extension in VIDEO_EXTENSIONS,
+            "is_raw": extension in RAW_EXTENSIONS,
+        }
+
+        try:
+            stat = (root / relative).stat()
+        except OSError:
+            missing += 1
+            entry["missing"] = True
+            entry["modified"] = 0
+            entry["accessed"] = 0
+            entry["created"] = 0
+        else:
+            entry["size"] = stat.st_size
+            entry["modified"] = stat.st_mtime
+            entry["accessed"] = stat.st_atime
+            entry["created"] = getattr(stat, 'st_birthtime', stat.st_ctime)
+
+        entries.append(entry)
+
+    return {"entries": entries, "outside": outside, "missing": missing}
 
 
 def scan_tree(directory: Path) -> dict:
@@ -1365,10 +1564,17 @@ def get_index_html() -> str:
                     </span>
                     <button class="btn" id="btn-clear-filter" title="Clear filter (Esc)" style="display:none;">&times;</button>
                     <button class="btn" id="btn-recursive" title="Show every photo below this folder (V)" data-shortcut="V">All photos</button>
+                    <span class="shortcut-wrap import-only" data-shortcut="B">
+                        <select class="btn" id="batch-select" title="Show only the files of one import (B)">
+                            <option value="">All folders</option>
+                        </select>
+                    </span>
                     <button class="btn import-only" id="btn-import-here" title="Import from this folder">Import this folder</button>
                     <button class="btn" id="btn-help" title="Show shortcuts (?)" data-shortcut="?">?</button>
                     <span class="file-count" id="file-count"></span>
                 </div>
+
+                <div class="batch-bar" id="batch-bar" hidden></div>
 
                 <div class="file-grid" id="file-grid"></div>
 
@@ -1640,6 +1846,7 @@ def get_index_html() -> str:
                         <h3>Other</h3>
                         <div class="help-row"><kbd>F</kbd> Focus filter</div>
                         <div class="help-row"><kbd>V</kbd> All photos below folder</div>
+                        <div class="help-row"><kbd>B</kbd> Files of one import</div>
                         <div class="help-row"><kbd>S</kbd> Size of selected folder</div>
                         <div class="help-row"><kbd>*</kbd> Favorite selected item</div>
                         <div class="help-row"><kbd>Esc</kbd> Clear filter / Close</div>
@@ -1935,6 +2142,7 @@ body {
     background: #16213e;
     border-bottom: 1px solid #0f3460;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 0.5rem;
 }
@@ -1996,12 +2204,14 @@ body {
 }
 
 /* Filter input */
-.filter-wrapper {
+.filter-wrapper,
+.shortcut-wrap {
     position: relative;
     display: inline-block;
 }
 
-.filter-wrapper[data-shortcut]::after {
+.filter-wrapper[data-shortcut]::after,
+.shortcut-wrap[data-shortcut]::after {
     content: attr(data-shortcut);
     position: absolute;
     top: -8px;
@@ -2018,7 +2228,8 @@ body {
     z-index: 1;
 }
 
-.show-shortcuts .filter-wrapper[data-shortcut]::after {
+.show-shortcuts .filter-wrapper[data-shortcut]::after,
+.show-shortcuts .shortcut-wrap[data-shortcut]::after {
     opacity: 1;
 }
 
@@ -2050,6 +2261,45 @@ body {
 
 .filter-wrapper:has(.filter-input:not(:placeholder-shown)) ~ #btn-clear-filter {
     display: inline-block !important;
+}
+
+#batch-select {
+    max-width: 300px;
+}
+
+/* Which import the grid is showing, and what it could not show */
+.batch-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    padding: 0.5rem 1rem;
+    background: #16213e;
+    border-bottom: 1px solid #0f3460;
+    font-size: 0.8rem;
+    color: #9aa4bd;
+}
+
+.batch-bar b {
+    color: #eee;
+}
+
+.batch-bar .batch-bar-paths {
+    color: #7a839c;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 40%;
+}
+
+.batch-bar .warn {
+    color: #f0b429;
+}
+
+.batch-bar .btn {
+    padding: 0.2rem 0.6rem;
+    font-size: 0.75rem;
+    margin-left: auto;
 }
 
 .file-count {
@@ -3312,6 +3562,10 @@ let conflictPage = 1;
 let storagePath = '.';
 let storageParent = null;
 let recursiveMode = false;   // V: every photo below the current folder
+let batchView = null;        // B: {media, id} when the grid shows one import
+let batchNeedsRefresh = false; // ask the server to re-read the batch, not its cache
+let batchIndex = [];         // imports offered in the picker, newest first
+let gridMode = 'folder';     // what the grid holds right now: folder | recursive | batch
 let sizePath = '.';          // folder shown in the size dialog
 let sizeParent = null;
 
@@ -3330,6 +3584,8 @@ const lightboxEl = document.getElementById('lightbox');
 const lightboxImgEl = document.getElementById('lightbox-img');
 const lightboxInfoEl = document.getElementById('lightbox-info');
 const filterInput = document.getElementById('filter-input');
+const batchSelect = document.getElementById('batch-select');
+const batchBarEl = document.getElementById('batch-bar');
 const clearFilterBtn = document.getElementById('btn-clear-filter');
 const jobBarEl = document.getElementById('job-bar');
 const batchListEl = document.getElementById('batch-list');
@@ -3348,6 +3604,18 @@ document.addEventListener('DOMContentLoaded', () => {
     loadDirectory('.', 1);
 
     document.getElementById('btn-recursive').addEventListener('click', () => toggleRecursive());
+    batchSelect.addEventListener('change', () => {
+        const value = batchSelect.value;
+        if (!value) {
+            exitBatchView();
+            return;
+        }
+        const [mediaType, id] = value.split(':');
+        enterBatchView(mediaType, parseInt(id, 10));
+    });
+    batchBarEl.addEventListener('click', (e) => {
+        if (e.target.closest('[data-exit-batch]')) exitBatchView();
+    });
     document.getElementById('btn-grid').addEventListener('click', () => setViewMode('grid'));
     document.getElementById('btn-list').addEventListener('click', () => setViewMode('list'));
     document.getElementById('lightbox-close').addEventListener('click', closeLightbox);
@@ -3586,6 +3854,18 @@ document.addEventListener('DOMContentLoaded', () => {
             toggleRecursive();
             return;
         }
+        if (key === 'b') {
+            e.preventDefault();
+            if (batchView) {
+                exitBatchView();
+            } else if (serverConfig.import_enabled) {
+                batchSelect.focus();
+                if (batchSelect.showPicker) {
+                    try { batchSelect.showPicker(); } catch (err) { /* not allowed here */ }
+                }
+            }
+            return;
+        }
         if (key === 's') {
             e.preventDefault();
             toggleSizeDialog();
@@ -3704,8 +3984,21 @@ async function loadDirectory(path, page = 1, restore = null) {
     paginationEl.innerHTML = '';
 
     try {
-        const endpoint = recursiveMode ? '/api/all' : '/api/list';
-        const res = await fetch(`${endpoint}?path=${encodeURIComponent(path)}&page=${page}&per_page=${perPage}&sort=${sortBy}&order=${sortOrder}`);
+        const common = `page=${page}&per_page=${perPage}&sort=${sortBy}&order=${sortOrder}`;
+        let url;
+        if (batchView) {
+            // One import, flattened - the folder we came from is kept for the way back
+            url = `/api/batch-media?media=${batchView.media}&id=${batchView.id}&${common}`;
+            if (batchNeedsRefresh) {
+                url += '&refresh=1';
+                batchNeedsRefresh = false;
+            }
+        } else {
+            const endpoint = recursiveMode ? '/api/all' : '/api/list';
+            url = `${endpoint}?path=${encodeURIComponent(path)}&${common}`;
+        }
+
+        const res = await fetch(url);
         const data = await res.json();
 
         if (data.error) {
@@ -3720,8 +4013,16 @@ async function loadDirectory(path, page = 1, restore = null) {
 
         // Store all items for filtering
         allItems = data.items;
+        gridMode = batchView ? 'batch' : (recursiveMode ? 'recursive' : 'folder');
 
-        renderBreadcrumb(path);
+        if (batchView) {
+            batchView.info = data.batch;
+            renderBatchBar(data.batch);
+            renderBatchBreadcrumb(data.batch);
+        } else {
+            renderBatchBar(null);
+            renderBreadcrumb(path);
+        }
         applyFilter(); // This will render files with current filter
         renderPagination(pag);
 
@@ -3752,6 +4053,8 @@ function toggleRecursive(force) {
     const wanted = force === undefined ? !recursiveMode : force;
     if (wanted === recursiveMode) return;
 
+    exitBatchView(false);   // the two flat views are alternatives, not layers
+
     if (wanted) rememberDirState();   // keep the folder's own spot for the way back
     recursiveMode = wanted;
     document.getElementById('btn-recursive').classList.toggle('active', recursiveMode);
@@ -3770,7 +4073,7 @@ function toggleRecursive(force) {
 const dirState = new Map();
 
 function rememberDirState() {
-    if (!currentPath || recursiveMode) return;
+    if (!currentPath || gridMode !== 'folder') return;
     dirState.set(currentPath, {
         page: currentPage,
         scrollTop: fileGridEl.scrollTop,
@@ -3780,6 +4083,7 @@ function rememberDirState() {
 
 // Navigate to a folder, landing where we left off if we have been there
 function navigateTo(path) {
+    exitBatchView(false);   // a folder was asked for, so stop showing one import
     if (recursiveMode) {
         recursiveMode = false;
         document.getElementById('btn-recursive').classList.remove('active');
@@ -3807,6 +4111,14 @@ function highlightItem(index) {
 
 // Update file count display
 function updateFileCount(pag) {
+    if (batchView) {
+        const total = pag ? pag.total_files : allItems.length;
+        fileCountEl.textContent = filterText
+            ? `Filter: ${getFilteredItems().length} matches`
+            : `Files from this import: ${total.toLocaleString()}`;
+        return;
+    }
+
     if (recursiveMode) {
         const total = pag ? pag.total_files : allItems.length;
         const where = currentPath === '.' ? 'the library' : currentPath;
@@ -3842,8 +4154,8 @@ function applyFilter() {
     const filtered = getFilteredItems();
     renderFiles(filtered);
 
-    // Update media for lightbox
-    media = filtered.filter(i => i.is_image || i.is_video);
+    // Update media for lightbox - a file gone from disk has nothing to show
+    media = filtered.filter(i => !i.missing && (i.is_image || i.is_video));
 
     // Update count display
     updateFileCount(null);
@@ -3855,6 +4167,120 @@ function clearFilter() {
     filterInput.value = '';
     clearFilterBtn.style.display = 'none';
     applyFilter();
+}
+
+// ---------------------------------------------------------------------------
+// Browsing one import: the files a batch put in the library, by date
+// ---------------------------------------------------------------------------
+
+async function loadBatchIndex() {
+    if (!serverConfig.import_enabled) return;
+    try {
+        const data = await api('GET', '/api/batch-index');
+        batchIndex = data.batches || [];
+    } catch (err) {
+        console.error('Failed to load imports:', err);
+        batchIndex = [];
+    }
+    renderBatchOptions();
+}
+
+function batchOptionLabel(batch) {
+    const when = formatBatchDate(batch.imported_at);
+    const kind = batch.media === 'video' ? 'videos' : 'photos';
+    const parts = (batch.source_directory || '').split('/').filter(Boolean);
+    const source = parts.slice(-2).join('/') || batch.source_directory;
+    return `${when} - ${(batch.copied || 0).toLocaleString()} ${kind} - ${source}`;
+}
+
+function formatBatchDate(value) {
+    return (value || '').replace('T', ' ').slice(0, 16) || 'unknown date';
+}
+
+function renderBatchOptions() {
+    const selected = batchView ? `${batchView.media}:${batchView.id}` : '';
+    let html = '<option value="">All folders</option>';
+
+    for (const batch of batchIndex) {
+        const value = `${batch.media}:${batch.id}`;
+        // A batch that landed somewhere else has nothing to show in this library
+        const label = batchOptionLabel(batch) + (batch.in_root ? '' : ' (other library)');
+        html += `<option value="${escapeHtml(value)}"${value === selected ? ' selected' : ''}`
+             + `${batch.in_root ? '' : ' disabled'}>${escapeHtml(label)}</option>`;
+    }
+
+    batchSelect.innerHTML = html;
+    batchSelect.classList.toggle('active', !!batchView);
+}
+
+function enterBatchView(mediaType, batchId) {
+    if (recursiveMode) {
+        recursiveMode = false;
+        document.getElementById('btn-recursive').classList.remove('active');
+        contentEl.classList.remove('recursive');
+    } else {
+        rememberDirState();   // keep the folder's own spot for the way back
+    }
+
+    batchView = {media: mediaType, id: batchId};
+    batchNeedsRefresh = true;
+    renderBatchOptions();
+    if (!batchIndex.some(b => b.media === mediaType && b.id === batchId)) {
+        loadBatchIndex();   // picked from elsewhere - make sure the list knows it
+    }
+
+    clearFilter();
+    loadDirectory(currentPath, 1);
+}
+
+function exitBatchView(reload = true) {
+    if (!batchView) return;
+
+    batchView = null;
+    batchSelect.value = '';
+    batchSelect.classList.remove('active');
+    renderBatchBar(null);
+
+    if (reload) {
+        const saved = dirState.get(currentPath);
+        loadDirectory(currentPath, saved ? saved.page : 1, saved || null);
+    }
+}
+
+// The strip above the grid: which import this is, and what it could not show
+function renderBatchBar(info) {
+    if (!info) {
+        batchBarEl.hidden = true;
+        batchBarEl.innerHTML = '';
+        return;
+    }
+
+    const kind = info.media === 'video' ? 'videos' : 'photos';
+    let html = `<span><b>Import #${info.id}</b> - ${kind}</span>`;
+    html += `<span>${escapeHtml(formatBatchDate(info.imported_at))}</span>`;
+    html += `<span><b>${(info.shown || 0).toLocaleString()}</b> files</span>`;
+
+    if (info.missing) {
+        html += `<span class="warn">${info.missing.toLocaleString()} no longer on disk</span>`;
+    }
+    if (info.outside) {
+        html += `<span class="warn">${info.outside.toLocaleString()} outside the served folder</span>`;
+    }
+
+    const paths = `${info.source_directory} \u2192 ${info.target_directory}`;
+    html += `<span class="batch-bar-paths" title="${escapeHtml(paths)}">${escapeHtml(paths)}</span>`;
+    html += `<button class="btn" data-exit-batch="1">Show all folders</button>`;
+
+    batchBarEl.innerHTML = html;
+    batchBarEl.hidden = false;
+}
+
+function renderBatchBreadcrumb(info) {
+    const label = info
+        ? `Import #${info.id} - ${formatBatchDate(info.imported_at)}`
+        : 'Import';
+    breadcrumbEl.innerHTML = `<a href="#" data-path=".">Home</a>`
+        + `<span class="separator">/</span><span>${escapeHtml(label)}</span>`;
 }
 
 // Render breadcrumb navigation
@@ -4221,6 +4647,8 @@ function activateSelectedItem(items) {
     if (selectedIndex < 0 || selectedIndex >= items.length) return;
 
     const item = items[selectedIndex];
+    if (item.classList.contains('missing')) return;
+
     if (item.classList.contains('folder')) {
         navigateTo(item.dataset.path);
     } else if (item.classList.contains('image') || item.classList.contains('video')) {
@@ -4531,6 +4959,9 @@ async function initManage() {
     document.getElementById('btn-refresh-volumes').addEventListener('click', loadVolumes);
     loadVolumes();
 
+    // Imports offered in the Browse toolbar, newest first
+    loadBatchIndex();
+
     // Defaults
     const targetInput = document.getElementById('scan-target');
     targetInput.value = serverConfig.root || '';
@@ -4731,11 +5162,18 @@ async function pollJobs() {
 }
 
 function refreshBrowseAfterJob() {
+    loadBatchIndex();   // a copy may have created or grown an import
+
     // Newly copied files may have appeared in the served tree
     if (currentView === 'browse') {
         loadedTreePaths.clear();
         loadTreeNode('.');
-        reloadCurrentDirectory();
+        if (batchView) {
+            batchNeedsRefresh = true;
+            loadDirectory(currentPath, currentPage);
+        } else {
+            reloadCurrentDirectory();
+        }
     }
 }
 
@@ -4873,6 +5311,8 @@ function renderBatches(batches) {
                     ${stats.failed ? '' : 'disabled'}>Retry ${stats.failed || 0} failed</button>
                 <button class="btn" data-action="failed" data-id="${batch.id}"
                     ${stats.failed ? '' : 'disabled'}>Show failed</button>
+                <button class="btn" data-action="files" data-id="${batch.id}"
+                    ${stats.copied ? '' : 'disabled'}>Show ${stats.copied || 0} imported files</button>
                 <button class="btn" data-action="browse" data-id="${batch.id}"
                     data-path="${escapeHtml(batch.target_directory)}">Open target</button>
             </div>
@@ -4905,6 +5345,9 @@ async function onBatchAction(e) {
             openConflicts(batchesMedia, batchId);
         } else if (action === 'failed') {
             await toggleFailedFiles(batchId);
+        } else if (action === 'files') {
+            setView('browse');
+            enterBatchView(batchesMedia, batchId);
         } else if (action === 'browse') {
             openTargetInBrowser(btn.dataset.path);
         }

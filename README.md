@@ -90,7 +90,7 @@ Tabs in the UI:
 
 | Tab | CLI equivalent |
 |-----|----------------|
-| **Browse** | browse the served folder, thumbnails, lightbox, keyboard navigation, favorites, and **V** for every photo below the current folder |
+| **Browse** | browse the served folder, thumbnails, lightbox, keyboard navigation, favorites, **V** for every photo below the current folder, and **B** for the files of a single import |
 | **Favorites** | every starred photo/video in one grid |
 | **Storage** | size in GB and photo/video counts per folder - per year inside the library - with drill-down |
 | **Import** | `scan` / `video-scan`, plus a shortcut for `copy` / `video-copy` of the latest batch |
@@ -106,6 +106,13 @@ Notes:
 - Under the source field, **Mounted volumes** lists what is plugged in (`/Volumes`, `/media`, `/mnt`), plus the served folder (★) and the home folder; one click fills in the source. The ↻ button rescans after plugging in a card.
 - The server uses the databases passed to the command: `photo-import --db my.db --video-db my_video.db serve ...`.
 - **S** opens a size dialog for whatever is selected in the hierarchy - the folder focused in the tree, otherwise the folder tile selected in the grid, otherwise the folder you are in. It shows the total size, photo/RAW/video counts and a per-subfolder table you can drill into; **Open in Storage** hands it over to the full view.
+- The **import picker** in the toolbar (**B**) lists every import that copied
+  files, newest first - `2024-07-14 18:20 - 412 photos - card_b/DCIM`. Pick one
+  and the grid shows only that batch's files, wherever they landed in the tree,
+  with the folder printed under each tile. **Show all folders** (or **B** again,
+  or clicking any folder) goes back to where you were. The strip above the grid
+  counts files that were deleted after the import and files that landed outside
+  the served folder. **Batches - Show N imported files** opens the same view.
 - **V** flattens a year, month or day into one thumbnail grid - every photo below it, paginated, with the folder printed under each tile. Press **V** again (or walk to another folder) to go back to the normal listing.
 - RAW files (`.arw`, `.orf`, `.cr2`, `.nef`, `.dng`, ...) are listed and counted as photos, shown with a RAW tile instead of a thumbnail - Pillow cannot render them.
 - **Storage** measures every subfolder of the one you are looking at, so opening it on `organized_photos` gives the per-year breakdown. Results are cached until you press **Rescan**.
