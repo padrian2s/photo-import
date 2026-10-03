@@ -337,18 +337,25 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
         for entry in self.favorites.list():
             full_path = root / entry["path"]
             extension = full_path.suffix.lower()
+            folder = str(Path(entry["path"]).parent)
             info = {
                 "path": entry["path"],
                 "name": full_path.name,
+                "folder": folder if folder != '.' else '',
                 "added_at": entry["added_at"],
                 "is_dir": False,
+                "extension": extension,
                 "is_image": extension in IMAGE_EXTENSIONS,
                 "is_video": extension in VIDEO_EXTENSIONS,
+                # RAW is a photo the browser cannot draw - it gets its own tile
+                "is_raw": extension in RAW_EXTENSIONS,
                 "favorite": True,
                 "missing": not full_path.exists(),
             }
             if not info["missing"]:
-                info["size"] = full_path.stat().st_size
+                stat = full_path.stat()
+                info["size"] = stat.st_size
+                info["modified"] = stat.st_mtime
             items.append(info)
 
         self.send_json({"favorites": items, "total": len(items)})
@@ -1499,6 +1506,13 @@ def get_index_html() -> str:
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Photo Browser</title>
+    <script>
+        // Before the stylesheet paints: no dark flash on a light library
+        try {
+            var saved = localStorage.getItem('photoBrowserTheme');
+            if (saved) document.documentElement.setAttribute('data-theme', saved);
+        } catch (e) { /* storage blocked - the dark default stands */ }
+    </script>
     <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -1514,27 +1528,39 @@ def get_index_html() -> str:
                     <button class="tab import-only" data-view="batches">Batches</button>
                     <button class="tab import-only" data-view="tools">Tools</button>
                 </nav>
-            </div>
-            <div class="breadcrumb" id="breadcrumb"></div>
-        </header>
 
-        <!-- Running / last job -->
-        <div class="job-bar" id="job-bar" hidden>
-            <div class="job-bar-head">
-                <span class="job-title" id="job-title"></span>
-                <span class="job-badge" id="job-badge"></span>
-                <div class="job-actions">
-                    <button class="btn danger" id="job-cancel">Stop</button>
-                    <button class="btn" id="job-dismiss">Dismiss</button>
+                <div class="header-tools">
+                    <!-- The running job, folded into one pill; click opens the detail -->
+                    <button class="job-pill" id="job-pill" hidden title="Running job - click for details">
+                        <span class="job-dot"></span>
+                        <span class="job-pill-title" id="job-pill-title"></span>
+                        <span class="job-pill-track"><span class="job-pill-fill" id="job-pill-fill"></span></span>
+                        <span class="job-pill-meta" id="job-pill-meta"></span>
+                    </button>
+                    <button class="icon-btn" id="btn-theme" title="Switch light / dark"><span class="theme-mark"></span></button>
+                    <button class="btn" id="btn-help" title="Show shortcuts (?)" data-shortcut="?">?</button>
+
+                    <!-- Running / last job -->
+                    <div class="job-bar" id="job-bar" hidden>
+                        <div class="job-bar-head">
+                            <span class="job-title" id="job-title"></span>
+                            <span class="job-badge" id="job-badge"></span>
+                            <div class="job-actions">
+                                <button class="btn danger" id="job-cancel">Stop</button>
+                                <button class="btn" id="job-dismiss">Dismiss</button>
+                            </div>
+                        </div>
+                        <div class="progress"><div class="progress-fill" id="job-progress"></div></div>
+                        <div class="job-meta">
+                            <span id="job-file"></span>
+                            <span id="job-counts"></span>
+                        </div>
+                        <div class="job-result" id="job-result"></div>
+                    </div>
                 </div>
             </div>
-            <div class="progress"><div class="progress-fill" id="job-progress"></div></div>
-            <div class="job-meta">
-                <span id="job-file"></span>
-                <span id="job-counts"></span>
-            </div>
-            <div class="job-result" id="job-result"></div>
-        </div>
+            <div class="header-progress" id="header-progress" hidden></div>
+        </header>
 
         <div class="main view active" id="view-browse">
             <nav class="sidebar" id="sidebar">
@@ -1542,43 +1568,57 @@ def get_index_html() -> str:
             </nav>
 
             <main class="content">
-                <div class="toolbar">
-                    <button class="btn" id="btn-grid" title="Grid view (G)" data-shortcut="G">Grid</button>
-                    <button class="btn" id="btn-list" title="List view (L)" data-shortcut="L">List</button>
-                    <select class="btn" id="per-page-select" title="Items per page (1-4)">
-                        <option value="25" data-shortcut="1">25</option>
-                        <option value="50" selected data-shortcut="2">50</option>
-                        <option value="100" data-shortcut="3">100</option>
-                        <option value="200" data-shortcut="4">200</option>
-                    </select>
-                    <select class="btn" id="sort-select" title="Sort by (S)">
-                        <option value="name" selected>Name (N)</option>
-                        <option value="modified">Modified (M)</option>
-                        <option value="created">Created (C)</option>
-                        <option value="accessed">Accessed (A)</option>
-                        <option value="size">Size (Z)</option>
-                    </select>
-                    <button class="btn" id="btn-sort-order" title="Sort order (O)" data-shortcut="O">↑</button>
-                    <span class="filter-wrapper" data-shortcut="F">
-                        <input type="text" class="filter-input" id="filter-input" placeholder="Filter..." title="Filter files (F)">
-                    </span>
-                    <button class="btn" id="btn-clear-filter" title="Clear filter (Esc)" style="display:none;">&times;</button>
-                    <button class="btn" id="btn-recursive" title="Show every photo below this folder (V)" data-shortcut="V">All photos</button>
-                    <span class="shortcut-wrap import-only" data-shortcut="B">
-                        <select class="btn" id="batch-select" title="Show only the files of one import (B)">
-                            <option value="">All folders</option>
-                        </select>
-                    </span>
-                    <button class="btn import-only" id="btn-import-here" title="Import from this folder">Import this folder</button>
-                    <button class="btn" id="btn-help" title="Show shortcuts (?)" data-shortcut="?">?</button>
+                <!-- Where you are: tree toggle, crumbs, and what is filtering the grid -->
+                <div class="path-bar">
+                    <button class="btn tiny" id="btn-tree" title="Toggle folder tree (T)" data-shortcut="T">&#9776;</button>
+                    <div class="breadcrumb" id="breadcrumb"></div>
+                    <div class="chip" id="batch-bar" hidden></div>
+                    <div class="chip" id="recursive-chip" hidden>
+                        <b>All photos below this folder</b>
+                        <button class="chip-close" data-exit-recursive="1" title="Back to the folder listing (V)">&times;</button>
+                    </div>
                     <span class="file-count" id="file-count"></span>
                 </div>
 
-                <div class="batch-bar" id="batch-bar" hidden></div>
+                <div class="toolbar">
+                    <span class="filter-wrapper" data-shortcut="F">
+                        <input type="text" class="filter-input" id="filter-input" placeholder="Filter" title="Filter files (F)">
+                    </span>
+                    <button class="btn" id="btn-clear-filter" title="Clear filter (Esc)" style="display:none;">&times;</button>
+                    <button class="btn" id="btn-grid" title="Grid view (G)" data-shortcut="G">Grid</button>
+                    <button class="btn" id="btn-list" title="List view (L)" data-shortcut="L">List</button>
+                    <select class="btn" id="sort-select" title="Sort by (N M C A Z)">
+                        <option value="name" selected>Name</option>
+                        <option value="modified">Modified</option>
+                        <option value="created">Created</option>
+                        <option value="accessed">Accessed</option>
+                        <option value="size">Size</option>
+                    </select>
+                    <button class="btn" id="btn-sort-order" title="Sort order (O)" data-shortcut="O">↑</button>
+                    <button class="btn" id="btn-recursive" title="Show every photo below this folder (V)" data-shortcut="V">All photos</button>
+                    <span class="shortcut-wrap import-only" data-shortcut="B">
+                        <select class="btn" id="batch-select" title="Show only the files of one import (B)">
+                            <option value="">Imports</option>
+                        </select>
+                    </span>
+                    <button class="btn import-only" id="btn-import-here" title="Scan this folder as an import source">Import this folder</button>
+                    <button class="btn" id="btn-size" title="Size of the selected folder (S)" data-shortcut="S">Size</button>
+                </div>
 
                 <div class="file-grid" id="file-grid"></div>
 
-                <div class="pagination" id="pagination"></div>
+                <div class="status-bar">
+                    <span class="status-left" id="status-left"></span>
+                    <span class="status-right">
+                        <div class="pagination" id="pagination"></div>
+                        <select id="per-page-select" title="Items per page (1-4)">
+                            <option value="25">25 / page</option>
+                            <option value="50" selected>50 / page</option>
+                            <option value="100">100 / page</option>
+                            <option value="200">200 / page</option>
+                        </select>
+                    </span>
+                </div>
             </main>
         </div>
 
@@ -1602,6 +1642,7 @@ def get_index_html() -> str:
                     <h2>Storage</h2>
                     <button class="btn" id="btn-storage-up">Up</button>
                     <button class="btn" id="btn-storage-refresh" title="Rescan the folder">Rescan</button>
+                    <button class="btn" id="btn-storage-browse" title="Open this folder in Browse">Open in Browse</button>
                 </div>
                 <div class="storage-path" id="storage-path"></div>
                 <div class="storage-summary" id="storage-summary"></div>
@@ -1688,6 +1729,8 @@ def get_index_html() -> str:
                     <button class="seg-btn" data-media="video">Videos</button>
                 </div>
 
+                <div class="latest-batch" id="latest-batch"></div>
+
                 <div class="options">
                     <label class="check"><input type="checkbox" id="copy-dry-run"> Dry run</label>
                     <label class="check"><input type="checkbox" id="copy-skip-no-date"> Skip files without EXIF/metadata date</label>
@@ -1696,6 +1739,7 @@ def get_index_html() -> str:
 
                 <div class="actions">
                     <button class="btn primary" id="btn-quick-copy">Copy latest batch</button>
+                    <button class="btn" id="btn-all-batches">All batches &rarr;</button>
                     <span class="form-error" id="copy-error"></span>
                 </div>
             </div>
@@ -1710,6 +1754,12 @@ def get_index_html() -> str:
                         <button class="seg-btn active" data-media="photo">Photos</button>
                         <button class="seg-btn" data-media="video">Videos</button>
                     </div>
+                    <span class="batch-legend">
+                        <span><i class="mix-copied"></i>copied</span>
+                        <span><i class="mix-skipped"></i>skipped</span>
+                        <span><i class="mix-conflicts"></i>conflicts</span>
+                        <span><i class="mix-failed"></i>failed</span>
+                    </span>
                     <button class="btn" id="btn-refresh-batches">Refresh</button>
                 </div>
                 <div id="batch-list" class="batch-list"></div>
@@ -1767,13 +1817,17 @@ def get_index_html() -> str:
 
         <!-- Lightbox overlay -->
         <div class="lightbox" id="lightbox">
-            <button class="lightbox-close" id="lightbox-close">&times;</button>
-            <button class="lightbox-fav" id="lightbox-fav" title="Favorite (f)">&#9734;</button>
-            <button class="lightbox-nav lightbox-prev" id="lightbox-prev">&lt;</button>
-            <button class="lightbox-nav lightbox-next" id="lightbox-next">&gt;</button>
+            <div class="lightbox-top">
+                <span class="lightbox-name" id="lightbox-name"></span>
+                <span class="lightbox-index" id="lightbox-index"></span>
+                <button class="lightbox-fav" id="lightbox-fav" title="Favorite (*)">&#9734;</button>
+                <button class="lightbox-close" id="lightbox-close" title="Close (Esc)">&times;</button>
+            </div>
             <div class="lightbox-content">
+                <button class="lightbox-nav lightbox-prev" id="lightbox-prev" title="Previous (&larr;)">&lsaquo;</button>
                 <img id="lightbox-img" src="" alt="">
                 <video id="lightbox-video" controls style="display:none;"></video>
+                <button class="lightbox-nav lightbox-next" id="lightbox-next" title="Next (&rarr;)">&rsaquo;</button>
             </div>
             <div class="lightbox-info" id="lightbox-info"></div>
         </div>
@@ -1816,44 +1870,43 @@ def get_index_html() -> str:
         <!-- Help overlay -->
         <div class="help-overlay" id="help-overlay">
             <div class="help-content">
-                <h2>Keyboard Shortcuts</h2>
+                <h2>Keyboard shortcuts<span class="help-hint">Press <kbd>?</kbd> or <kbd>Esc</kbd> to close</span></h2>
                 <div class="help-columns">
                     <div class="help-section">
                         <h3>View</h3>
                         <div class="help-row"><kbd>G</kbd> Grid view</div>
                         <div class="help-row"><kbd>L</kbd> List view</div>
+                        <div class="help-row"><kbd>T</kbd> Toggle folder tree</div>
                         <div class="help-row"><kbd>1-4</kbd> Items per page</div>
+                        <div class="help-row"><kbd>?</kbd> This help</div>
                     </div>
                     <div class="help-section">
-                        <h3>Sort By</h3>
-                        <div class="help-row"><kbd>N</kbd> Name</div>
-                        <div class="help-row"><kbd>M</kbd> Modified date</div>
-                        <div class="help-row"><kbd>C</kbd> Created date</div>
-                        <div class="help-row"><kbd>A</kbd> Accessed date</div>
-                        <div class="help-row"><kbd>Z</kbd> Size</div>
-                        <div class="help-row"><kbd>O</kbd> Toggle order ↑↓</div>
+                        <h3>Sort</h3>
+                        <div class="help-row"><kbd>N</kbd> By name</div>
+                        <div class="help-row"><kbd>M</kbd> By modified date</div>
+                        <div class="help-row"><kbd>C</kbd> By created date</div>
+                        <div class="help-row"><kbd>A</kbd> By accessed date</div>
+                        <div class="help-row"><kbd>Z</kbd> By size</div>
+                        <div class="help-row"><kbd>O</kbd> Flip order</div>
                     </div>
                     <div class="help-section">
-                        <h3>Navigation</h3>
-                        <div class="help-row"><kbd>[</kbd> Previous page</div>
-                        <div class="help-row"><kbd>]</kbd> Next page</div>
-                        <div class="help-row"><kbd>Tab</kbd> Switch panel</div>
-                        <div class="help-row"><kbd>↑↓←→</kbd> Navigate items</div>
+                        <h3>Navigate</h3>
+                        <div class="help-row"><kbd>[ ]</kbd> Previous / next page</div>
+                        <div class="help-row"><kbd>&larr; &rarr;</kbd> Select item</div>
                         <div class="help-row"><kbd>Enter</kbd> Open item</div>
                         <div class="help-row"><kbd>Backspace</kbd> Parent folder</div>
+                        <div class="help-row"><kbd>Tab</kbd> Switch panel</div>
+                        <div class="help-row"><kbd>Esc</kbd> Clear filter / close</div>
                     </div>
                     <div class="help-section">
-                        <h3>Other</h3>
+                        <h3>Library</h3>
                         <div class="help-row"><kbd>F</kbd> Focus filter</div>
                         <div class="help-row"><kbd>V</kbd> All photos below folder</div>
                         <div class="help-row"><kbd>B</kbd> Files of one import</div>
                         <div class="help-row"><kbd>S</kbd> Size of selected folder</div>
                         <div class="help-row"><kbd>*</kbd> Favorite selected item</div>
-                        <div class="help-row"><kbd>Esc</kbd> Clear filter / Close</div>
-                        <div class="help-row"><kbd>?</kbd> Toggle this help</div>
                     </div>
                 </div>
-                <p class="help-hint">Press <kbd>?</kbd> to close</p>
             </div>
         </div>
     </div>
@@ -1865,7 +1918,63 @@ def get_index_html() -> str:
 
 def get_styles_css() -> str:
     """Return CSS styles."""
-    return '''* {
+    return '''/* Tokens - every colour in the UI comes from here.
+   light-dark() picks a side from the root color-scheme, so the theme toggle
+   is one attribute on <html> and nothing else has to know. */
+:root {
+    color-scheme: dark;
+
+    --bg: #1a1b1e;
+    --bg: light-dark(#f4f4f6, #1a1b1e);
+    --surface: #202226;
+    --surface: light-dark(#ffffff, #202226);
+    --sunk: #27292e;
+    --sunk: light-dark(#ebebee, #27292e);
+    --line: #2e3137;
+    --line: light-dark(#e1e1e6, #2e3137);
+    --line-strong: #3b3f47;
+    --line-strong: light-dark(#cdced5, #3b3f47);
+    --line-faint: #232529;
+    --line-faint: light-dark(#ededf0, #232529);
+
+    --fg: #e9e9ec;
+    --fg: light-dark(#1c1d21, #e9e9ec);
+    --muted: #9b9fa8;
+    --muted: light-dark(#696c76, #9b9fa8);
+    --faint: #696d77;
+    --faint: light-dark(#9b9da6, #696d77);
+
+    --accent: #6fa1ee;
+    --accent: light-dark(#2a63c4, #6fa1ee);
+    --accent-soft: #243247;
+    --accent-soft: light-dark(#e4edfb, #243247);
+    --accent-fg: #0f1a2b;
+    --accent-fg: light-dark(#ffffff, #0f1a2b);
+
+    --ok: #7ed29a;
+    --ok: light-dark(#1f7a3f, #7ed29a);
+    --ok-soft: #1f3328;
+    --ok-soft: light-dark(#e2f4e8, #1f3328);
+    --warn: #e5b94c;
+    --warn: light-dark(#8a5d08, #e5b94c);
+    --warn-soft: #3a3221;
+    --warn-soft: light-dark(#fbf0d9, #3a3221);
+    --danger: #f08b85;
+    --danger: light-dark(#c4332e, #f08b85);
+    --danger-soft: #3a2527;
+    --danger-soft: light-dark(#fbe6e5, #3a2527);
+    --star: #f0b429;
+
+    --mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    --radius: 5px;
+    --radius-lg: 8px;
+    --control: 26px;
+}
+
+html[data-theme="light"] { color-scheme: light; }
+html[data-theme="dark"] { color-scheme: dark; }
+
+* {
     box-sizing: border-box;
     margin: 0;
     padding: 0;
@@ -1873,93 +1982,155 @@ def get_styles_css() -> str:
 
 body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    background: #1a1a2e;
-    color: #eee;
-    line-height: 1.5;
+    font-size: 13px;
+    background: var(--bg);
+    color: var(--fg);
+    line-height: 1.4;
+    -webkit-font-smoothing: antialiased;
 }
 
 .app {
     display: flex;
     flex-direction: column;
     height: 100vh;
+    overflow: hidden;
 }
+
+/* ---------------------------------------------------------------- header */
 
 .header {
-    background: #16213e;
-    padding: 1rem;
-    border-bottom: 1px solid #0f3460;
-}
-
-.header h1 {
-    font-size: 1.5rem;
-    margin-bottom: 0.5rem;
-    color: #e94560;
-}
-
-.breadcrumb {
-    font-size: 0.9rem;
-    color: #888;
-}
-
-.breadcrumb a {
-    color: #4db5ff;
-    text-decoration: none;
-}
-
-.breadcrumb a:hover {
-    text-decoration: underline;
-}
-
-.breadcrumb .separator {
-    margin: 0 0.5rem;
-    color: #555;
+    position: relative;
+    flex-shrink: 0;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
 }
 
 .header-row {
     display: flex;
     align-items: center;
-    gap: 1.5rem;
-    margin-bottom: 0.5rem;
+    gap: 4px;
+    height: 40px;
+    padding: 0 10px 0 14px;
 }
 
+.header h1,
 .header-row h1 {
-    margin-bottom: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 14px 0 0;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: -.01em;
+    white-space: nowrap;
+    color: var(--fg);
+}
+
+/* The little photo mark in front of the name */
+.header h1::before {
+    content: "";
+    width: 14px;
+    height: 11px;
+    border-radius: 2px;
+    background: var(--accent);
+    box-shadow: -4px -3px 0 -3px var(--accent);
 }
 
 .tabs {
     display: flex;
-    gap: 0.25rem;
+    align-items: stretch;
+    height: 40px;
+    gap: 2px;
 }
 
 .tab {
-    padding: 0.4rem 0.9rem;
-    border: 1px solid #0f3460;
-    background: #1a1a2e;
-    color: #ccc;
-    border-radius: 4px;
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 40px;
+    padding: 0 10px;
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    font-family: inherit;
+    font-size: 13px;
     cursor: pointer;
-    font-size: 0.85rem;
 }
 
 .tab:hover {
-    background: #0f3460;
-    color: #eee;
+    color: var(--fg);
 }
 
 .tab.active {
-    background: #e94560;
-    border-color: #e94560;
-    color: #fff;
+    color: var(--fg);
+    font-weight: 600;
+}
+
+.tab.active::after {
+    content: "";
+    position: absolute;
+    left: 10px;
+    right: 10px;
+    bottom: -1px;
+    height: 2px;
+    border-radius: 1px;
+    background: var(--accent);
+}
+
+.tab-count {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+}
+
+.header-tools {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    position: relative;
 }
 
 .import-only.hidden {
     display: none;
 }
 
-/* Views */
+/* Icon-only buttons in the header (theme, help) */
+.icon-btn {
+    width: 28px;
+    height: var(--control);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--fg);
+    border-radius: var(--radius);
+    font-family: inherit;
+    cursor: pointer;
+}
+
+.icon-btn:hover {
+    background: var(--sunk);
+}
+
+/* Half-filled circle: the usual "switch theme" mark */
+.theme-mark {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    border: 1.5px solid var(--fg);
+    background: linear-gradient(90deg, var(--fg) 50%, transparent 50%);
+}
+
+/* ------------------------------------------------------------------ views */
+
 .view {
     display: none;
     flex: 1;
+    min-height: 0;
     overflow: hidden;
 }
 
@@ -1973,49 +2144,75 @@ body {
 
 .panel-view {
     flex-direction: column;
+    align-items: center;
     overflow-y: auto;
-    padding: 1.5rem;
-    gap: 1.5rem;
+    padding: 20px 24px 32px;
+    gap: 16px;
 }
 
+.content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* ------------------------------------------------------------------- tree */
+
 .sidebar {
-    width: 280px;
-    background: #16213e;
-    border-right: 1px solid #0f3460;
+    width: 220px;
+    flex-shrink: 0;
+    background: var(--surface);
+    border-right: 1px solid var(--line);
     overflow-y: auto;
-    padding: 1rem;
+    padding: 8px 6px;
+}
+
+.sidebar[hidden] {
+    display: none;
 }
 
 .tree {
-    font-size: 0.9rem;
+    font-size: 12.5px;
 }
 
 .tree-item {
-    padding: 0.3rem 0;
+    padding: 0;
 }
 
 .tree-folder {
-    cursor: pointer;
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    padding: 0.2rem 0;
+    gap: 4px;
+    height: 24px;
+    padding: 0 6px 0 2px;
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .tree-folder:hover {
-    color: #e94560;
+    background: var(--sunk);
 }
 
 .tree-folder.has-children::before {
-    content: ">";
-    font-size: 0.7rem;
-    transition: transform 0.2s;
-    width: 10px;
+    content: "\\203A";
+    width: 14px;
+    flex-shrink: 0;
+    text-align: center;
+    color: var(--faint);
+    font-size: 13px;
+    transition: transform 0.15s;
 }
 
 .tree-folder:not(.has-children)::before {
     content: "";
-    width: 10px;
+    width: 14px;
+    flex-shrink: 0;
 }
 
 .tree-folder.open::before {
@@ -2026,7 +2223,8 @@ body {
     content: "";
     width: 10px;
     height: 10px;
-    border: 2px solid #e94560;
+    margin: 0 2px;
+    border: 2px solid var(--accent);
     border-top-color: transparent;
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
@@ -2037,7 +2235,7 @@ body {
 }
 
 .tree-children {
-    margin-left: 1.2rem;
+    margin-left: 10px;
     display: none;
 }
 
@@ -2046,676 +2244,592 @@ body {
 }
 
 .tree-folder.active {
-    color: #e94560;
-    font-weight: bold;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 600;
 }
 
 .tree-folder.focused {
-    background: #0f3460;
-    border-radius: 4px;
-    outline: 2px solid #4db5ff;
-    outline-offset: 1px;
+    outline: 1px solid var(--accent);
+    outline-offset: -1px;
 }
 
-/* Panel focus indicators */
+/* Which panel the arrow keys drive */
 .sidebar.focused {
-    box-shadow: inset 0 0 0 2px #4db5ff;
+    box-shadow: inset 2px 0 0 var(--accent);
 }
 
 .content.focused {
-    box-shadow: inset 0 0 0 2px #4db5ff;
+    box-shadow: inset 2px 0 0 var(--accent);
 }
 
 .tree-empty {
-    color: #666;
+    color: var(--faint);
     font-style: italic;
-    padding: 0.3rem 0;
+    padding: 4px 8px;
 }
 
 .loading-indicator {
-    color: #888;
-    padding: 2rem;
+    color: var(--muted);
+    padding: 40px 0;
     text-align: center;
+    font-size: 12.5px;
+    grid-column: 1 / -1;
 }
 
-.content {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-}
+/* --------------------------------------------------------------- path bar */
 
-/* Pagination */
-.pagination {
+.path-bar {
+    flex-shrink: 0;
+    min-height: 36px;
     display: flex;
-    justify-content: center;
     align-items: center;
-    gap: 0.5rem;
-    padding: 1rem;
-    background: #16213e;
-    border-top: 1px solid #0f3460;
-    flex-wrap: wrap;
+    gap: 6px;
+    padding: 0 10px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
 }
 
-.pagination:empty {
+.breadcrumb {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+    min-width: 0;
+    overflow: hidden;
+    font-size: 12.5px;
+    white-space: nowrap;
+    color: var(--muted);
+}
+
+.breadcrumb a {
+    color: var(--muted);
+    text-decoration: none;
+    padding: 2px 4px;
+    border-radius: 4px;
+}
+
+.breadcrumb a:hover {
+    background: var(--sunk);
+    text-decoration: none;
+}
+
+.breadcrumb a:last-child {
+    color: var(--fg);
+    font-weight: 600;
+}
+
+.breadcrumb .separator {
+    color: var(--faint);
+}
+
+/* Chips in the path bar: one import, or the flattened view */
+.chip {
+    display: inline-flex;
+    align-items: center;
+    overflow: hidden;
+    flex-shrink: 1;
+    gap: 8px;
+    height: 24px;
+    padding: 0 4px 0 8px;
+    border-radius: 12px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 12px;
+    white-space: nowrap;
+    min-width: 0;
+}
+
+.chip[hidden] {
     display: none;
 }
 
-.pagination .page-btn {
-    padding: 0.5rem 1rem;
-    border: 1px solid #0f3460;
-    background: #1a1a2e;
-    color: #eee;
-    border-radius: 4px;
+.chip b {
+    font-weight: 600;
+}
+
+.chip .mono {
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+.chip .chip-paths {
+    font-family: var(--mono);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    max-width: 260px;
+}
+
+.chip .warn {
+    color: var(--warn);
+}
+
+.chip-close {
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: inherit;
     cursor: pointer;
-    font-size: 0.9rem;
-    min-width: 40px;
+    font-size: 14px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
 }
 
-.pagination .page-btn:hover:not(:disabled) {
-    background: #0f3460;
+.chip-close:hover {
+    background: var(--surface);
 }
 
-.pagination .page-btn.active {
-    background: #e94560;
-    border-color: #e94560;
+.file-count {
+    margin-left: auto;
+    padding-left: 8px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+    white-space: nowrap;
 }
 
-.pagination .page-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-}
-
-.pagination .page-info {
-    color: #888;
-    font-size: 0.85rem;
-    padding: 0 1rem;
-}
-
-.pagination .page-ellipsis {
-    color: #666;
-    padding: 0 0.5rem;
-}
+/* ---------------------------------------------------------------- toolbar */
 
 .toolbar {
-    padding: 0.75rem 1rem;
-    background: #16213e;
-    border-bottom: 1px solid #0f3460;
+    flex-shrink: 0;
+    min-height: 36px;
+    padding: 5px 10px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 0.5rem;
+    gap: 6px;
+}
+
+.toolbar-title {
+    font-weight: 600;
+    margin-right: 4px;
 }
 
 .btn {
-    padding: 0.4rem 0.8rem;
-    border: 1px solid #0f3460;
-    background: #1a1a2e;
-    color: #eee;
-    border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: var(--control);
+    padding: 0 8px;
+    border: 1px solid var(--line-strong);
+    background: var(--surface);
+    color: var(--fg);
+    border-radius: var(--radius);
+    font-family: inherit;
+    font-size: 12.5px;
+    font-weight: 500;
+    white-space: nowrap;
     cursor: pointer;
-    font-size: 0.85rem;
 }
 
 .btn:hover {
-    background: #0f3460;
+    background: var(--sunk);
 }
 
 .btn.active {
-    background: #e94560;
-    border-color: #e94560;
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
 }
 
-/* Keyboard shortcut badges */
+.btn.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-fg);
+    font-weight: 600;
+}
+
+.btn.primary:hover {
+    background: var(--accent);
+    filter: brightness(1.08);
+}
+
+.btn.danger {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+.btn.danger:hover {
+    background: var(--danger-soft);
+}
+
+.btn.tiny {
+    height: 24px;
+    width: 24px;
+    padding: 0;
+    justify-content: center;
+    border-color: transparent;
+    background: transparent;
+    color: var(--muted);
+}
+
+.btn.tiny:hover {
+    background: var(--sunk);
+}
+
+.btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.btn:disabled:hover {
+    background: var(--surface);
+    filter: none;
+}
+
+select.btn {
+    padding-right: 4px;
+}
+
+/* Keyboard shortcut badges, shown while the help overlay is up */
 .btn[data-shortcut],
-.page-btn[data-shortcut] {
+.page-btn[data-shortcut],
+.filter-wrapper,
+.shortcut-wrap {
     position: relative;
 }
 
+.filter-wrapper,
+.shortcut-wrap {
+    display: inline-flex;
+    align-items: center;
+}
+
 .btn[data-shortcut]::after,
-.page-btn[data-shortcut]::after {
+.page-btn[data-shortcut]::after,
+.filter-wrapper[data-shortcut]::after,
+.shortcut-wrap[data-shortcut]::after {
     content: attr(data-shortcut);
     position: absolute;
-    top: -8px;
-    right: -8px;
-    background: #e94560;
-    color: #fff;
-    font-size: 0.65rem;
-    font-weight: bold;
-    padding: 2px 5px;
+    top: -7px;
+    right: -7px;
+    z-index: 1;
+    font-family: var(--mono);
+    font-size: 9.5px;
+    font-weight: 600;
+    line-height: 1;
+    padding: 2px 3px;
+    border: 1px solid var(--line-strong);
     border-radius: 3px;
+    background: var(--surface);
+    color: var(--muted);
     opacity: 0;
-    transition: opacity 0.2s;
+    transition: opacity 0.15s;
     pointer-events: none;
 }
 
 .show-shortcuts .btn[data-shortcut]::after,
-.show-shortcuts .page-btn[data-shortcut]::after {
+.show-shortcuts .page-btn[data-shortcut]::after,
+.show-shortcuts .filter-wrapper[data-shortcut]::after,
+.show-shortcuts .shortcut-wrap[data-shortcut]::after {
     opacity: 1;
 }
 
 #btn-help {
-    min-width: 32px;
-    font-weight: bold;
+    min-width: 28px;
+    justify-content: center;
+    font-weight: 600;
 }
 
 #btn-help.active::after {
     display: none;
 }
 
-/* Filter input */
-.filter-wrapper,
-.shortcut-wrap {
-    position: relative;
-    display: inline-block;
-}
-
-.filter-wrapper[data-shortcut]::after,
-.shortcut-wrap[data-shortcut]::after {
-    content: attr(data-shortcut);
-    position: absolute;
-    top: -8px;
-    right: -8px;
-    background: #e94560;
-    color: #fff;
-    font-size: 0.65rem;
-    font-weight: bold;
-    padding: 2px 5px;
-    border-radius: 3px;
-    opacity: 0;
-    transition: opacity 0.2s;
-    pointer-events: none;
-    z-index: 1;
-}
-
-.show-shortcuts .filter-wrapper[data-shortcut]::after,
-.show-shortcuts .shortcut-wrap[data-shortcut]::after {
-    opacity: 1;
-}
-
 .filter-input {
-    padding: 0.4rem 0.8rem;
-    border: 1px solid #0f3460;
-    background: #1a1a2e;
-    color: #eee;
-    border-radius: 4px;
-    font-size: 0.85rem;
-    width: 150px;
+    height: var(--control);
+    width: 170px;
+    padding: 0 8px;
+    border: 1px solid var(--line-strong);
+    background: var(--surface);
+    color: var(--fg);
+    border-radius: var(--radius);
+    font-family: inherit;
+    font-size: 12.5px;
     outline: none;
 }
 
 .filter-input:focus {
-    border-color: #4db5ff;
-    box-shadow: 0 0 0 2px rgba(77, 181, 255, 0.2);
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-soft);
 }
 
 .filter-input::placeholder {
-    color: #666;
+    color: var(--faint);
 }
 
 #btn-clear-filter {
-    padding: 0.4rem 0.6rem;
-    margin-left: 4px;
-    border-radius: 4px;
+    width: 24px;
+    padding: 0;
+    justify-content: center;
 }
 
 .filter-wrapper:has(.filter-input:not(:placeholder-shown)) ~ #btn-clear-filter {
-    display: inline-block !important;
+    display: inline-flex !important;
 }
 
 #batch-select {
-    max-width: 300px;
+    max-width: 260px;
 }
 
-/* Which import the grid is showing, and what it could not show */
-.batch-bar {
+/* Import is the one panel with two columns */
+#view-import.active {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+    align-items: start;
+    align-content: start;
+    width: 100%;
+    max-width: 928px;
+    margin: 0 auto;
+}
+
+/* The batch the quick copy would run on */
+.latest-batch {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
-    flex-wrap: wrap;
-    padding: 0.5rem 1rem;
-    background: #16213e;
-    border-bottom: 1px solid #0f3460;
-    font-size: 0.8rem;
-    color: #9aa4bd;
+    gap: 10px;
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--bg);
+    font-size: 12.5px;
 }
 
-.batch-bar b {
-    color: #eee;
+.latest-batch .batch-id {
+    font-size: 12.5px;
 }
 
-.batch-bar .batch-bar-paths {
-    color: #7a839c;
+.latest-batch .source {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+    white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+.latest-batch .pending {
+    margin-left: auto;
+    font-family: var(--mono);
+    font-size: 11.5px;
     white-space: nowrap;
-    max-width: 40%;
 }
 
-.batch-bar .warn {
-    color: #f0b429;
+.latest-batch:empty {
+    display: none;
 }
 
-.batch-bar .btn {
-    padding: 0.2rem 0.6rem;
-    font-size: 0.75rem;
-    margin-left: auto;
+#btn-tree {
+    width: 28px;
+    height: var(--control);
+    font-size: 13px;
+    flex-shrink: 0;
 }
 
-.file-count {
-    margin-left: auto;
-    color: #888;
-    font-size: 0.85rem;
-}
+/* ------------------------------------------------------------------- grid */
 
 .file-grid {
     flex: 1;
     overflow-y: auto;
-    padding: 1rem;
+    padding: 10px 12px;
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(124px, 1fr));
     /* Rows follow their content - 1fr would stretch a single row over the
        whole viewport and squash the tiles once there are many */
     grid-auto-rows: max-content;
-    gap: 0.5rem;
+    gap: 6px 8px;
     align-content: start;
-    align-items: stretch;
-}
-
-.file-grid.list-view {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
 }
 
 .file-item {
-    background: #16213e;
-    border-radius: 8px;
-    overflow: hidden;
-    cursor: pointer;
-    transition: transform 0.2s, box-shadow 0.2s;
+    position: relative;
     display: flex;
     flex-direction: column;
+    gap: 5px;
+    padding: 4px;
+    border-radius: 6px;
+    background: transparent;
+    cursor: pointer;
     min-height: 0;
 }
 
 .file-item:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    background: var(--sunk);
 }
 
 .file-item.selected {
-    outline: 3px solid #e94560;
-    outline-offset: -3px;
-    box-shadow: 0 0 12px rgba(233, 69, 96, 0.4);
+    background: var(--accent-soft);
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
 }
 
-.file-item.folder {
-    background: #0f3460;
+.file-thumb,
+.file-icon,
+.raw-icon,
+.video-icon {
+    width: 100%;
+    aspect-ratio: 1;
+    min-height: 0;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: var(--sunk);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
 }
 
 .file-thumb {
-    width: 100%;
-    flex: 1;
-    aspect-ratio: 1;
-    min-height: 60px;
     object-fit: contain;
     object-position: center;
-    background: #0f3460;
     display: block;
 }
 
 .file-icon {
-    width: 100%;
-    flex: 1;
-    aspect-ratio: 1;
-    min-height: 60px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 3rem;
-    background: #0f3460;
-    color: #4db5ff;
+    font-size: 30px;
+    color: var(--accent);
 }
 
 .raw-icon {
-    width: 100%;
-    flex: 1;
-    aspect-ratio: 1;
-    min-height: 60px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: linear-gradient(135deg, #16213e 0%, #0f3460 100%);
-    color: #8a93a8;
-    font-size: 0.95rem;
-    font-weight: 700;
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
     letter-spacing: 0.08em;
+    color: var(--muted);
 }
 
-.file-grid.list-view .raw-icon {
-    aspect-ratio: auto;
-    width: 48px;
-    height: 48px;
-    min-height: 48px;
-    font-size: 0.65rem;
+.video-icon {
+    font-size: 24px;
+    color: var(--muted);
+}
+
+.file-name {
+    padding: 0 2px;
+    font-size: 12px;
+    line-height: 1.3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
     flex-shrink: 0;
 }
 
 .file-sub {
-    padding: 0 0.5rem 0.3rem;
-    font-size: 0.68rem;
-    color: #8a93a8;
+    padding: 0 2px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    line-height: 1.4;
+    color: var(--muted);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
     flex-shrink: 0;
 }
 
-.file-name {
-    padding: 0.3rem 0.5rem;
-    font-size: 0.75rem;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    flex-shrink: 0;
-}
-
-/* List view styles */
-.file-grid.list-view .file-item {
-    display: flex;
-    flex-direction: row;
-    align-items: center;
-    border-radius: 4px;
-}
-
-.file-grid.list-view .file-thumb,
-.file-grid.list-view .file-icon,
-.file-grid.list-view .video-icon {
-    aspect-ratio: auto;
-    width: 48px;
-    height: 48px;
-    min-height: 48px;
-    max-height: 48px;
-    font-size: 1.4rem;
-    flex-shrink: 0;
-}
-
-.file-grid.list-view .file-name {
-    flex: 1;
-}
-
-/* Lightbox */
-.lightbox {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100vw;
-    height: 100vh;
-    background: rgba(0,0,0,0.95);
+/* Columns that only the list view shows */
+.file-kind,
+.file-size,
+.file-date {
     display: none;
-    flex-direction: column;
-    z-index: 1000;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+    white-space: nowrap;
     overflow: hidden;
 }
 
-.lightbox.active {
-    display: flex;
-}
-
-.lightbox-close {
-    position: absolute;
-    top: 1rem;
-    right: 1rem;
-    background: rgba(0,0,0,0.5);
-    border: none;
-    color: white;
-    font-size: 2rem;
-    cursor: pointer;
-    z-index: 10;
-    width: 44px;
-    height: 44px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: 50%;
-}
-
-.lightbox-close:hover {
-    background: rgba(255,255,255,0.2);
-}
-
-.lightbox-nav {
-    position: absolute;
-    top: 50%;
-    transform: translateY(-50%);
-    background: rgba(0,0,0,0.5);
-    border: none;
-    color: white;
-    font-size: 2rem;
-    cursor: pointer;
-    padding: 1rem 1.5rem;
-    z-index: 10;
-}
-
-.lightbox-nav:hover {
-    background: rgba(255,255,255,0.2);
-}
-
-.lightbox-prev {
-    left: 0;
-    border-radius: 0 8px 8px 0;
-}
-
-.lightbox-next {
-    right: 0;
-    border-radius: 8px 0 0 8px;
-}
-
-.lightbox-content {
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 50px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 1rem 4rem;
-    overflow: hidden;
-}
-
-#lightbox-img,
-#lightbox-video {
-    max-width: 100%;
-    max-height: 100%;
-    width: auto;
-    height: auto;
-    object-fit: contain;
-}
-
-#lightbox-video {
-    background: #000;
-}
-
-.file-item.video .file-thumb {
-    position: relative;
-}
-
-.file-item.video::after {
-    content: "";
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    width: 0;
-    height: 0;
-    border-left: 20px solid rgba(255,255,255,0.9);
-    border-top: 12px solid transparent;
-    border-bottom: 12px solid transparent;
-    pointer-events: none;
+.file-item.folder .file-icon {
+    color: var(--accent);
 }
 
 .file-item.video {
     position: relative;
 }
 
-.video-icon {
-    width: 100%;
-    flex: 1;
-    aspect-ratio: 1;
-    min-height: 60px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 3rem;
-    background: linear-gradient(135deg, #1a1a2e 0%, #0f3460 100%);
-    color: #e94560;
+.file-item.video .file-thumb {
+    position: relative;
 }
 
-.lightbox-info {
+/* The play triangle sits over the thumbnail, not over the name */
+.file-item.video::after {
+    content: "";
     position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    height: 50px;
-    padding: 0.8rem 1rem;
-    text-align: center;
-    background: rgba(0,0,0,0.8);
-    font-size: 0.9rem;
+    top: 4px;
+    left: 4px;
+    right: 4px;
+    aspect-ratio: 1;
+    background:
+        linear-gradient(transparent, transparent),
+        radial-gradient(circle, rgba(0,0,0,.55) 18px, transparent 19px);
+    background-position: center;
+    background-repeat: no-repeat;
+    pointer-events: none;
+}
+
+.file-item.video .video-play {
+    position: absolute;
+    top: 4px;
+    left: 4px;
+    right: 4px;
+    aspect-ratio: 1;
     display: flex;
     align-items: center;
     justify-content: center;
-}
-
-/* Cards & forms (import / batches / tools) */
-.card {
-    background: #16213e;
-    border: 1px solid #0f3460;
-    border-radius: 8px;
-    padding: 1.25rem;
-    max-width: 900px;
-    width: 100%;
-}
-
-.card h2 {
-    font-size: 1.1rem;
-    color: #e94560;
-    margin-bottom: 0.5rem;
-}
-
-.card-head {
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-    margin-bottom: 1rem;
-    flex-wrap: wrap;
-}
-
-.card-head h2 {
-    margin-bottom: 0;
-    margin-right: auto;
-}
-
-.card-hint {
-    color: #8a93a8;
-    font-size: 0.85rem;
-    margin-bottom: 1rem;
-}
-
-.card-hint code {
-    background: #0f3460;
-    padding: 0.1rem 0.35rem;
-    border-radius: 3px;
-}
-
-.seg {
-    display: inline-flex;
-    border: 1px solid #0f3460;
-    border-radius: 4px;
-    overflow: hidden;
-    margin-bottom: 1rem;
-}
-
-.seg-btn {
-    padding: 0.35rem 0.9rem;
-    background: #1a1a2e;
-    border: none;
-    color: #ccc;
-    cursor: pointer;
-    font-size: 0.85rem;
-}
-
-.seg-btn.active {
-    background: #0f3460;
+    pointer-events: none;
     color: #fff;
+    font-size: 20px;
+    text-shadow: 0 1px 6px rgba(0,0,0,.6);
 }
 
-.field {
-    margin-bottom: 0.9rem;
+.file-item.missing {
+    opacity: 0.55;
+    outline: 1px dashed var(--danger);
+    outline-offset: -1px;
 }
 
-.field label {
-    display: block;
-    font-size: 0.8rem;
-    color: #8a93a8;
-    margin-bottom: 0.3rem;
+.empty,
+.error {
+    grid-column: 1 / -1;
+    padding: 40px 0;
+    text-align: center;
+    font-size: 12.5px;
+    color: var(--muted);
 }
 
-.field-row {
-    display: flex;
-    gap: 0.5rem;
+.error {
+    color: var(--danger);
 }
 
-.field-row input[type="text"] {
-    flex: 1;
-    min-width: 0;
-    padding: 0.45rem 0.6rem;
-    background: #1a1a2e;
-    border: 1px solid #0f3460;
-    border-radius: 4px;
-    color: #eee;
-    font-size: 0.85rem;
-    font-family: inherit;
-}
-
-.field-row input[type="text"]:focus {
-    outline: none;
-    border-color: #4db5ff;
-}
-
-/* Favorites */
-.tab-count {
-    opacity: 0.75;
-}
-
-.toolbar-title {
-    font-weight: 600;
-    margin-right: 0.5rem;
-}
-
+/* Favourite star over a tile */
 .fav-toggle {
     position: absolute;
-    top: 0.35rem;
-    right: 0.35rem;
-    width: 28px;
-    height: 28px;
+    top: 8px;
+    right: 8px;
+    width: 24px;
+    height: 24px;
     border: none;
     border-radius: 50%;
-    background: rgba(0,0,0,0.55);
+    background: rgba(0,0,0,0.5);
     color: #ddd;
-    font-size: 0.95rem;
+    font-size: 14px;
     line-height: 1;
     cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
+    padding: 0;
     opacity: 0;
-    transition: opacity 0.15s;
-}
-
-.file-item {
-    position: relative;
+    transition: opacity 0.12s;
 }
 
 .file-item:hover .fav-toggle,
@@ -2725,91 +2839,1069 @@ body {
 }
 
 .fav-toggle:hover {
-    background: rgba(0,0,0,0.8);
-    color: #ffd45e;
+    background: rgba(0,0,0,0.75);
+    color: var(--star);
 }
 
 .fav-toggle.on {
-    color: #ffd45e;
+    color: var(--star);
 }
 
-.file-item.missing {
-    opacity: 0.55;
-    outline: 1px dashed #e94560;
+/* ------------------------------------------------------------- list view */
+
+.file-grid.list-view {
+    display: block;
+    padding: 0;
 }
 
-.lightbox-fav {
-    position: absolute;
-    top: 1rem;
-    right: 4.5rem;
-    background: rgba(0,0,0,0.5);
-    border: none;
-    color: white;
-    font-size: 1.6rem;
-    cursor: pointer;
-    z-index: 10;
-    width: 44px;
+.list-head,
+.file-grid.list-view .file-item {
+    display: grid;
+    grid-template-columns: 36px minmax(0, 1fr) 80px 90px 150px 32px;
+    align-items: center;
+    gap: 0;
+    padding: 0 12px 0 8px;
+}
+
+.file-grid.list-view .file-thumb,
+.file-grid.list-view .file-icon,
+.file-grid.list-view .raw-icon,
+.file-grid.list-view .video-icon { grid-column: 1; }
+.file-grid.list-view .file-name { grid-column: 2; }
+.file-grid.list-view .file-kind { grid-column: 3; }
+.file-grid.list-view .file-size { grid-column: 4; }
+.file-grid.list-view .file-date { grid-column: 5; }
+.file-grid.list-view .fav-toggle { grid-column: 6; }
+
+.list-head {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    height: 28px;
+    background: var(--bg);
+    border-bottom: 1px solid var(--line);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+}
+
+.list-head span:nth-child(4),
+.list-head span:nth-child(5) {
+    text-align: right;
+    padding-right: 4px;
+}
+
+.file-grid:not(.list-view) .list-head {
+    display: none;
+}
+
+.file-grid.list-view .file-item {
+    height: 30px;
+    border-radius: 0;
+    border-bottom: 1px solid var(--line-faint);
+    font-size: 12.5px;
+}
+
+.file-grid.list-view .file-thumb,
+.file-grid.list-view .file-icon,
+.file-grid.list-view .raw-icon,
+.file-grid.list-view .video-icon {
+    width: 24px;
+    height: 24px;
+    aspect-ratio: auto;
+    border-radius: 3px;
+    font-size: 12px;
+}
+
+.file-grid.list-view .raw-icon {
+    font-size: 7px;
+    letter-spacing: 0;
+}
+
+.file-grid.list-view .file-name {
+    padding: 0 8px;
+}
+
+.file-grid.list-view .file-sub {
+    display: none;
+}
+
+.file-grid.list-view .file-kind {
+    display: block;
+}
+
+.file-grid.list-view .file-size,
+.file-grid.list-view .file-date {
+    display: block;
+    text-align: right;
+    padding-right: 4px;
+}
+
+.file-grid.list-view .file-item.video::after,
+.file-grid.list-view .video-play {
+    display: none;
+}
+
+.file-grid.list-view .fav-toggle {
+    position: static;
+    background: transparent;
+    width: 22px;
+    height: 22px;
+    justify-self: end;
+}
+
+/* --------------------------------------------------------------- lightbox */
+
+.lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: none;
+    flex-direction: column;
+    background: rgba(8,8,10,.96);
+    background: light-dark(rgba(24,24,28,.97), rgba(8,8,10,.96));
+    color: #f2f2f4;
+    overflow: hidden;
+}
+
+.lightbox.active {
+    display: flex;
+}
+
+.lightbox-top {
+    flex-shrink: 0;
     height: 44px;
     display: flex;
     align-items: center;
-    justify-content: center;
-    border-radius: 50%;
+    gap: 12px;
+    padding: 0 10px 0 16px;
 }
 
+.lightbox-name {
+    font-weight: 600;
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.lightbox-index {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: rgba(242,242,244,.6);
+    white-space: nowrap;
+}
+
+.lightbox-close,
+.lightbox-fav {
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: #f2f2f4;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    line-height: 1;
+}
+
+.lightbox-close {
+    font-size: 20px;
+}
+
+.lightbox-fav {
+    margin-left: auto;
+    font-size: 18px;
+}
+
+.lightbox-close:hover,
 .lightbox-fav:hover {
-    background: rgba(255,255,255,0.2);
+    background: rgba(255,255,255,0.1);
 }
 
 .lightbox-fav.on {
-    color: #ffd45e;
+    color: var(--star);
 }
 
-/* Storage */
-.storage-path {
-    font-size: 0.85rem;
-    color: #9ecfff;
-    margin-bottom: 0.75rem;
+.lightbox-content {
+    flex: 1;
+    min-height: 0;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 8px 56px;
+    overflow: hidden;
+}
+
+.lightbox-nav {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 56px;
+    border: none;
+    background: transparent;
+    color: rgba(242,242,244,.55);
+    font-size: 30px;
+    cursor: pointer;
+    padding: 0;
+    z-index: 10;
+}
+
+.lightbox-nav:hover {
+    color: #f2f2f4;
+    background: rgba(255,255,255,0.04);
+}
+
+.lightbox-prev { left: 0; }
+.lightbox-next { right: 0; }
+
+#lightbox-img,
+#lightbox-video {
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    box-shadow: 0 10px 40px rgba(0,0,0,.5);
+}
+
+#lightbox-video {
+    background: #000;
+}
+
+.lightbox-info {
+    flex-shrink: 0;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 18px;
+    padding: 0 16px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: rgba(242,242,244,.7);
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+/* ------------------------------------------------------------- status bar */
+
+.status-bar {
+    flex-shrink: 0;
+    min-height: 30px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 2px 10px;
+    background: var(--surface);
+    border-top: 1px solid var(--line);
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.status-left {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.status-right {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.pagination {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+}
+
+.pagination:empty {
+    display: none;
+}
+
+.pagination .page-btn {
+    min-width: 24px;
+    height: 24px;
+    padding: 0 6px;
+    border: 1px solid var(--line-strong);
+    background: var(--surface);
+    color: var(--fg);
+    border-radius: var(--radius);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    cursor: pointer;
+}
+
+.pagination .page-btn:hover:not(:disabled) {
+    background: var(--sunk);
+}
+
+.pagination .page-btn.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-fg);
+}
+
+.pagination .page-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.pagination .page-info {
+    color: var(--muted);
+    font-size: 11.5px;
+    padding: 0 6px;
+}
+
+.pagination .page-ellipsis {
+    color: var(--faint);
+    padding: 0 4px;
+}
+
+#per-page-select {
+    height: 24px;
+    padding: 0 4px;
+    border: 1px solid var(--line-strong);
+    background: var(--surface);
+    color: var(--muted);
+    border-radius: var(--radius);
+    font-family: inherit;
+    font-size: 11.5px;
+    cursor: pointer;
+    outline: none;
+}
+
+/* ------------------------------------------------------- cards and forms */
+
+.card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-lg);
+    padding: 16px 18px;
+    max-width: 880px;
+    width: 100%;
+}
+
+.card h2 {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--fg);
+    margin-bottom: 8px;
+}
+
+.card-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+}
+
+.card-head h2 {
+    margin-bottom: 0;
+    margin-right: auto;
+}
+
+.card-hint {
+    color: var(--muted);
+    font-size: 12.5px;
+    margin-bottom: 12px;
+}
+
+.card-hint code {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    background: var(--sunk);
+    padding: 1px 5px;
+    border-radius: 3px;
+}
+
+.seg {
+    display: inline-flex;
+    height: 24px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    overflow: hidden;
+    margin-bottom: 12px;
+}
+
+.card-head .seg {
+    margin-bottom: 0;
+}
+
+.seg-btn {
+    padding: 0 10px;
+    background: var(--surface);
+    border: none;
+    color: var(--muted);
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+}
+
+.seg-btn + .seg-btn {
+    border-left: 1px solid var(--line-strong);
+}
+
+.seg-btn:hover {
+    background: var(--sunk);
+}
+
+.seg-btn.active {
+    background: var(--accent-soft);
+    color: var(--accent);
+}
+
+.field {
+    margin-bottom: 12px;
+}
+
+.field label {
+    display: block;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--muted);
+    margin-bottom: 6px;
+}
+
+.field-row {
+    display: flex;
+    gap: 6px;
+}
+
+.field-row input[type="text"] {
+    flex: 1;
+    min-width: 0;
+    height: 28px;
+    padding: 0 8px;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: 12px;
+    outline: none;
+}
+
+.field-row input[type="text"]:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.field-row .btn {
+    height: 28px;
+}
+
+.dest-hint {
+    margin-top: 6px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
     word-break: break-all;
+}
+
+.dest-hint:empty {
+    display: none;
+}
+
+.options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 18px;
+    margin: 12px 0;
+}
+
+.check {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+    color: var(--fg);
+    cursor: pointer;
+}
+
+.check input[type="checkbox"] {
+    margin: 0;
+    accent-color: var(--accent);
+}
+
+.check input[type="number"] {
+    width: 64px;
+    height: 24px;
+    padding: 0 6px;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: 12px;
+    outline: none;
+}
+
+.actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+}
+
+.actions .btn {
+    height: 28px;
+    padding: 0 12px;
+}
+
+.form-error {
+    color: var(--danger);
+    font-size: 12.5px;
+}
+
+.form-ok {
+    color: var(--ok);
+    font-size: 12.5px;
+}
+
+/* Mounted volumes quick pick (import source) */
+.volumes {
+    margin-top: 8px;
+}
+
+.volumes-head {
+    display: flex;
+    align-items: center;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin-bottom: 6px;
+}
+
+.volumes-head span {
+    margin-right: auto;
+}
+
+.volume-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+}
+
+.vol-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    height: 24px;
+    padding: 0 9px;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: 12px;
+    color: var(--fg);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.vol-btn:hover {
+    background: var(--sunk);
+    border-color: var(--accent);
+}
+
+.vol-btn .vol-icon {
+    flex-shrink: 0;
+    color: var(--muted);
+    font-size: 11px;
+}
+
+.vol-btn .vol-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.volume-list .empty-row {
+    color: var(--faint);
+    font-size: 12px;
+}
+
+/* ----------------------------------------------------------- the job pill */
+
+.job-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    height: var(--control);
+    padding: 0 10px;
+    border: 1px solid var(--line-strong);
+    background: var(--surface);
+    color: var(--fg);
+    border-radius: 13px;
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.job-pill[hidden] {
+    display: none;
+}
+
+.job-pill:hover {
+    background: var(--sunk);
+}
+
+.job-pill .job-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.job-pill .job-pill-title {
+    font-weight: 500;
+}
+
+.job-pill .job-pill-track {
+    width: 64px;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--line);
+    overflow: hidden;
+}
+
+.job-pill .job-pill-fill {
+    display: block;
+    height: 100%;
+    width: 0;
+    background: var(--accent);
+    transition: width 0.2s linear;
+}
+
+.job-pill .job-pill-meta {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+}
+
+/* Thin progress line under the whole header */
+.header-progress {
+    position: absolute;
+    left: 0;
+    bottom: -1px;
+    height: 2px;
+    width: 0;
+    background: var(--accent);
+    pointer-events: none;
+    transition: width 0.2s linear;
+}
+
+.header-progress[hidden] {
+    display: none;
+}
+
+/* The popover the pill opens */
+.job-bar {
+    position: absolute;
+    top: 34px;
+    right: 0;
+    z-index: 50;
+    width: 360px;
+    padding: 12px 14px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: 0 16px 40px rgba(0,0,0,.28);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.job-bar[hidden] {
+    display: none;
+}
+
+.job-bar-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.job-title {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.job-badge,
+.batch-status,
+.conflict-badge {
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 3px 6px;
+    border-radius: 4px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    white-space: nowrap;
+}
+
+.job-badge.completed,
+.batch-status.completed,
+.conflict-badge.identical {
+    background: var(--ok-soft);
+    color: var(--ok);
+}
+
+.job-badge.failed,
+.batch-status.failed,
+.conflict-badge.different {
+    background: var(--danger-soft);
+    color: var(--danger);
+}
+
+.job-badge.cancelled,
+.batch-status.paused {
+    background: var(--warn-soft);
+    color: var(--warn);
+}
+
+.job-actions {
+    margin-left: auto;
+    display: flex;
+    gap: 6px;
+}
+
+.job-actions .btn {
+    height: 24px;
+    font-size: 12px;
+}
+
+.progress {
+    height: 4px;
+    background: var(--line);
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.progress-fill {
+    height: 100%;
+    width: 0;
+    background: var(--accent);
+    transition: width 0.2s linear;
+}
+
+.job-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+}
+
+.job-meta span {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.job-result {
+    font-size: 12px;
+    color: var(--fg);
+}
+
+.job-result:empty {
+    display: none;
+}
+
+/* --------------------------------------------------------------- batches */
+
+.batch-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.batch {
+    border: 1px solid var(--line);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.batch-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    min-width: 0;
+}
+
+.batch-id {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--fg);
+}
+
+.batch-when {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+}
+
+/* copied / skipped / conflicts / failed, as one bar */
+.batch-mix {
+    display: flex;
+    height: 6px;
+    border-radius: 3px;
+    overflow: hidden;
+    background: var(--sunk);
+}
+
+.batch-mix span {
+    display: block;
+}
+
+.batch-mix .mix-copied { background: var(--ok); }
+.batch-mix .mix-skipped { background: var(--line-strong); }
+.batch-mix .mix-conflicts { background: var(--warn); }
+.batch-mix .mix-failed { background: var(--danger); }
+
+.batch-legend {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 11px;
+    color: var(--muted);
+}
+
+.batch-legend span {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.batch-legend i {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    display: inline-block;
+}
+
+.batch-legend .mix-copied { background: var(--ok); }
+.batch-legend .mix-skipped { background: var(--line-strong); }
+.batch-legend .mix-conflicts { background: var(--warn); }
+.batch-legend .mix-failed { background: var(--danger); }
+
+.card-head .batch-legend {
+    margin-left: auto;
+}
+
+.batch-paths {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+    word-break: break-all;
+}
+
+.batch-head .batch-paths {
+    margin-left: auto;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    word-break: normal;
+    min-width: 0;
+}
+
+.batch-stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 16px;
+    font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+}
+
+.batch-stats b {
+    font-family: var(--mono);
+    font-weight: 600;
+    color: var(--fg);
+}
+
+.batch-stats b.warn { color: var(--warn); }
+.batch-stats b.bad { color: var(--danger); }
+
+.batch-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+.batch-actions .btn.warn {
+    border-color: var(--warn);
+    background: var(--warn-soft);
+    color: var(--warn);
+    font-weight: 600;
+}
+
+.batch-actions .btn.ghost {
+    border-color: transparent;
+    background: transparent;
+    color: var(--accent);
+}
+
+.batch-actions .btn.ghost:hover {
+    background: var(--sunk);
+}
+
+.batch-failed {
+    border-top: 1px solid var(--line);
+    padding-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--danger);
+    max-height: 200px;
+    overflow-y: auto;
+}
+
+.batch-failed div {
+    word-break: break-all;
+}
+
+/* ------------------------------------------------------- jobs and server */
+
+.job-history {
+    display: flex;
+    flex-direction: column;
+}
+
+.job-row {
+    display: grid;
+    grid-template-columns: 92px minmax(0, 1fr) 150px 70px;
+    align-items: center;
+    gap: 12px;
+    height: 32px;
+    border-top: 1px solid var(--line-faint);
+    font-size: 12.5px;
+}
+
+.job-row:first-child {
+    border-top: none;
+}
+
+.job-row .grow {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.job-row .when,
+.job-row .elapsed {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+}
+
+.job-row .elapsed {
+    text-align: right;
+}
+
+.server-info {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 4px 16px;
+    font-size: 12.5px;
+    color: var(--muted);
+}
+
+.server-info div {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--fg);
+    word-break: break-all;
+}
+
+.server-info div.label {
+    font-family: inherit;
+    font-size: 12.5px;
+    color: var(--muted);
+}
+
+/* --------------------------------------------------------------- storage */
+
+.storage-path {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+    word-break: break-all;
+    margin-bottom: 12px;
 }
 
 .storage-summary {
     display: flex;
     flex-wrap: wrap;
-    gap: 1.25rem;
-    padding: 0.75rem 0.9rem;
-    margin-bottom: 1rem;
-    background: #1a1a2e;
-    border: 1px solid #0f3460;
-    border-radius: 6px;
-    font-size: 0.85rem;
-}
-
-.storage-summary b {
-    color: #eee;
-    font-size: 1.05rem;
+    gap: 0 28px;
+    padding: 12px 14px;
+    margin-bottom: 14px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-lg);
 }
 
 .storage-summary span {
-    color: #8a93a8;
     display: flex;
     flex-direction: column;
-    gap: 0.15rem;
+    gap: 2px;
+    font-size: 11px;
+    color: var(--muted);
+}
+
+.storage-summary b {
+    font-family: var(--mono);
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--fg);
 }
 
 .storage-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 0.85rem;
+    font-size: 12.5px;
 }
 
 .storage-table th {
     text-align: right;
-    padding: 0.4rem 0.6rem;
-    color: #8a93a8;
-    font-size: 0.72rem;
+    padding: 0 8px;
+    height: 30px;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.06em;
-    border-bottom: 1px solid #0f3460;
+    letter-spacing: 0.04em;
+    border-bottom: 1px solid var(--line);
 }
 
 .storage-table th:first-child,
@@ -2818,18 +3910,19 @@ body {
 }
 
 .storage-table td {
-    padding: 0.4rem 0.6rem;
-    border-bottom: 1px solid #16213e;
+    padding: 0 8px;
+    height: 32px;
+    border-bottom: 1px solid var(--line-faint);
 }
 
 .storage-table tr:hover td {
-    background: #16213e;
+    background: var(--sunk);
 }
 
 .storage-table .folder-link {
-    color: #4db5ff;
+    color: var(--accent);
     cursor: pointer;
-    font-weight: 600;
+    font-weight: 500;
 }
 
 .storage-table .folder-link:hover {
@@ -2838,109 +3931,97 @@ body {
 
 .storage-table .num {
     text-align: right;
+    font-family: var(--mono);
+    font-size: 11.5px;
     font-variant-numeric: tabular-nums;
 }
 
 .storage-bar {
     height: 6px;
     min-width: 2px;
-    background: #e94560;
+    background: var(--accent);
     border-radius: 3px;
 }
 
 .storage-table tfoot td {
-    font-weight: 700;
-    border-top: 2px solid #0f3460;
+    font-weight: 600;
+    background: var(--bg);
     border-bottom: none;
 }
 
-/* Conflicts */
+/* ------------------------------------------------------------- conflicts */
+
 .bulk-actions {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: 6px;
     flex-wrap: wrap;
-    padding: 0.6rem 0.8rem;
-    margin-bottom: 1rem;
-    background: #1a1a2e;
-    border: 1px solid #0f3460;
-    border-radius: 6px;
-    font-size: 0.85rem;
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-lg);
+    font-size: 12.5px;
+    color: var(--muted);
 }
 
 .conflict-list {
     display: flex;
     flex-direction: column;
-    gap: 0.9rem;
+    gap: 12px;
 }
 
 .conflict {
-    border: 1px solid #0f3460;
-    border-radius: 6px;
-    background: #1a1a2e;
-    padding: 0.9rem;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
 }
 
 .conflict-head {
     display: flex;
     align-items: center;
-    gap: 0.6rem;
+    gap: 10px;
     flex-wrap: wrap;
-    margin-bottom: 0.7rem;
 }
 
 .conflict-name {
+    font-family: var(--mono);
+    font-size: 13px;
     font-weight: 600;
     word-break: break-all;
 }
 
-.conflict-badge {
-    font-size: 0.68rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    padding: 0.15rem 0.5rem;
-    border-radius: 10px;
-    background: #3a3a1a;
-    color: #e8d16f;
-}
-
-.conflict-badge.identical {
-    background: #1c4532;
-    color: #6fdc8c;
-}
-
-.conflict-badge.different {
-    background: #4a1420;
-    color: #ff8ba0;
-}
-
 .conflict-sides {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-    gap: 0.9rem;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 10px;
 }
 
 .conflict-side {
-    border: 1px solid #0f3460;
-    border-radius: 6px;
-    padding: 0.6rem;
-    background: #16213e;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
 }
 
 .conflict-side h4 {
-    font-size: 0.78rem;
+    font-size: 11px;
+    font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: #8a93a8;
-    margin-bottom: 0.5rem;
+    letter-spacing: 0.04em;
+    color: var(--muted);
 }
 
 .conflict-side .preview {
     width: 100%;
-    height: 180px;
+    height: 150px;
     object-fit: contain;
-    background: #0f3460;
-    border-radius: 4px;
+    background: var(--sunk);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
     display: block;
 }
 
@@ -2951,382 +4032,52 @@ body {
 
 .conflict-side .no-preview {
     width: 100%;
-    height: 180px;
+    height: 150px;
     display: flex;
     align-items: center;
     justify-content: center;
-    background: #0f3460;
-    border-radius: 4px;
-    color: #8a93a8;
-    font-size: 0.8rem;
+    background: var(--sunk);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    color: var(--muted);
+    font-size: 12px;
     text-align: center;
-    padding: 0.5rem;
+    padding: 8px;
 }
 
 .conflict-meta {
-    margin-top: 0.5rem;
-    font-size: 0.78rem;
-    color: #8a93a8;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 2px 10px;
+    font-size: 12px;
+    color: var(--muted);
     word-break: break-all;
 }
 
 .conflict-meta b {
-    color: #eee;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    font-weight: 400;
+    color: var(--fg);
+}
+
+.conflict-meta b.warn {
+    color: var(--warn);
 }
 
 .conflict-actions {
-    display: flex;
-    gap: 0.5rem;
-    flex-wrap: wrap;
-    margin-top: 0.8rem;
-}
-
-.dest-hint {
-    margin-top: 0.35rem;
-    font-size: 0.78rem;
-    color: #9ecfff;
-    word-break: break-all;
-}
-
-.dest-hint:empty {
-    display: none;
-}
-
-/* Mounted volumes quick pick (import source) */
-.volumes {
-    margin-top: 0.6rem;
-}
-
-.volumes-head {
-    display: flex;
-    align-items: center;
-    font-size: 0.7rem;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: #8a93a8;
-    margin-bottom: 0.35rem;
-}
-
-.volumes-head span {
-    margin-right: auto;
-}
-
-.btn.tiny {
-    padding: 0.05rem 0.4rem;
-    font-size: 0.8rem;
-    line-height: 1.3;
-}
-
-.volume-list {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.4rem;
-}
-
-.vol-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-    max-width: 100%;
-    padding: 0.25rem 0.6rem;
-    background: #1a1a2e;
-    border: 1px solid #0f3460;
-    border-radius: 12px;
-    color: #ccc;
-    font-size: 0.8rem;
-    font-family: inherit;
-    cursor: pointer;
-    white-space: nowrap;
-}
-
-.vol-btn:hover {
-    background: #0f3460;
-    color: #eee;
-    border-color: #4db5ff;
-}
-
-.vol-btn .vol-icon {
-    flex-shrink: 0;
-    color: #8a93a8;
-}
-
-.vol-btn .vol-name {
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.volume-list .empty-row {
-    color: #666;
-    font-size: 0.8rem;
-}
-
-.options {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 1rem;
-    margin: 0.75rem 0 1rem;
-}
-
-.check {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    font-size: 0.85rem;
-    color: #ccc;
-    cursor: pointer;
-}
-
-.check input[type="number"] {
-    width: 100px;
-    padding: 0.25rem 0.4rem;
-    background: #1a1a2e;
-    border: 1px solid #0f3460;
-    border-radius: 4px;
-    color: #eee;
-    font-family: inherit;
-}
-
-.actions {
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-}
-
-.btn.primary {
-    background: #e94560;
-    border-color: #e94560;
-    color: #fff;
-    font-weight: 600;
-}
-
-.btn.primary:hover {
-    background: #d13a53;
-}
-
-.btn.danger {
-    border-color: #e94560;
-    color: #ff8ba0;
-}
-
-.btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-}
-
-.form-error {
-    color: #ff8ba0;
-    font-size: 0.85rem;
-}
-
-.form-ok {
-    color: #6fdc8c;
-    font-size: 0.85rem;
-}
-
-/* Job bar */
-.job-bar {
-    background: #16213e;
-    border-bottom: 1px solid #0f3460;
-    padding: 0.75rem 1rem;
-}
-
-.job-bar[hidden] {
-    display: none;
-}
-
-.job-bar-head {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    margin-bottom: 0.5rem;
-}
-
-.job-title {
-    font-size: 0.9rem;
-    font-weight: 600;
-}
-
-.job-badge {
-    font-size: 0.7rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    padding: 0.15rem 0.5rem;
-    border-radius: 10px;
-    background: #0f3460;
-    color: #9ecfff;
-}
-
-.job-badge.completed { background: #1c4532; color: #6fdc8c; }
-.job-badge.failed { background: #4a1420; color: #ff8ba0; }
-.job-badge.cancelled { background: #3a3a1a; color: #e8d16f; }
-
-.job-actions {
     margin-left: auto;
     display: flex;
-    gap: 0.5rem;
-}
-
-.progress {
-    height: 8px;
-    background: #0f3460;
-    border-radius: 4px;
-    overflow: hidden;
-}
-
-.progress-fill {
-    height: 100%;
-    width: 0;
-    background: #e94560;
-    transition: width 0.2s linear;
-}
-
-.job-meta {
-    display: flex;
-    justify-content: space-between;
-    gap: 1rem;
-    font-size: 0.78rem;
-    color: #8a93a8;
-    margin-top: 0.35rem;
-}
-
-.job-meta span {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.job-result {
-    font-size: 0.82rem;
-    color: #ccc;
-    margin-top: 0.4rem;
-}
-
-.job-result:empty {
-    display: none;
-}
-
-/* Batches */
-.batch-list {
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-}
-
-.batch {
-    border: 1px solid #0f3460;
-    border-radius: 6px;
-    padding: 0.9rem;
-    background: #1a1a2e;
-}
-
-.batch-head {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    flex-wrap: wrap;
-    margin-bottom: 0.5rem;
-}
-
-.batch-id {
-    font-weight: 600;
-    color: #e94560;
-}
-
-.batch-status {
-    font-size: 0.7rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    padding: 0.15rem 0.5rem;
-    border-radius: 10px;
-    background: #0f3460;
-    color: #9ecfff;
-}
-
-.batch-status.completed { background: #1c4532; color: #6fdc8c; }
-.batch-status.failed { background: #4a1420; color: #ff8ba0; }
-.batch-status.paused { background: #3a3a1a; color: #e8d16f; }
-
-.batch-paths {
-    font-size: 0.78rem;
-    color: #8a93a8;
-    margin-bottom: 0.6rem;
-    word-break: break-all;
-}
-
-.batch-stats {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 1rem;
-    font-size: 0.8rem;
-    margin-bottom: 0.7rem;
-}
-
-.batch-stats b {
-    color: #eee;
-}
-
-.batch-actions {
-    display: flex;
-    gap: 0.5rem;
+    gap: 6px;
     flex-wrap: wrap;
 }
 
-.batch-failed {
-    margin-top: 0.7rem;
-    border-top: 1px solid #0f3460;
-    padding-top: 0.6rem;
-    font-size: 0.78rem;
-    color: #ff8ba0;
-    max-height: 220px;
-    overflow-y: auto;
-}
+/* ------------------------------------------------------------- modals */
 
-.batch-failed div {
-    padding: 0.15rem 0;
-    word-break: break-all;
-}
-
-/* Job history & server info */
-.job-history {
-    display: flex;
-    flex-direction: column;
-    gap: 0.4rem;
-    font-size: 0.82rem;
-}
-
-.job-row {
-    display: flex;
-    gap: 0.75rem;
-    align-items: center;
-    padding: 0.4rem 0.6rem;
-    background: #1a1a2e;
-    border: 1px solid #0f3460;
-    border-radius: 4px;
-}
-
-.job-row .grow {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.server-info {
-    font-size: 0.82rem;
-    color: #8a93a8;
-    word-break: break-all;
-}
-
-.server-info div {
-    padding: 0.15rem 0;
-}
-
-/* Directory picker modal */
 .modal {
     position: fixed;
     inset: 0;
-    background: rgba(0,0,0,0.7);
+    background: rgba(0,0,0,0.45);
     display: none;
     align-items: center;
     justify-content: center;
@@ -3338,103 +4089,143 @@ body {
 }
 
 .modal-box {
-    background: #16213e;
-    border: 1px solid #0f3460;
-    border-radius: 8px;
-    width: min(600px, 92vw);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: 0 24px 64px rgba(0,0,0,.35);
+    width: min(560px, 92vw);
     max-height: 80vh;
     display: flex;
     flex-direction: column;
-    padding: 1rem;
-    gap: 0.75rem;
+    overflow: hidden;
 }
 
 .modal-head {
     display: flex;
     align-items: center;
+    gap: 10px;
+    height: 44px;
+    padding: 0 10px 0 16px;
+    border-bottom: 1px solid var(--line);
+    flex-shrink: 0;
 }
 
 .modal-head h3 {
-    font-size: 1rem;
+    font-size: 13px;
+    font-weight: 600;
     margin-right: auto;
 }
 
+.modal-head .btn {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    justify-content: center;
+    border-color: transparent;
+    background: transparent;
+    color: var(--muted);
+    font-size: 18px;
+}
+
+.modal-head .btn:hover {
+    background: var(--sunk);
+}
+
 .modal-path {
-    font-size: 0.8rem;
-    color: #9ecfff;
+    padding: 8px 16px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
     word-break: break-all;
+    flex-shrink: 0;
 }
 
 .modal-list {
     flex: 1;
     overflow-y: auto;
-    border: 1px solid #0f3460;
-    border-radius: 4px;
+    border-top: 1px solid var(--line-faint);
     min-height: 200px;
 }
 
 .modal-list .dir-row {
-    padding: 0.4rem 0.6rem;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 30px;
+    padding: 0 16px;
     cursor: pointer;
-    font-size: 0.85rem;
-    border-bottom: 1px solid #0f3460;
+    font-size: 12.5px;
+    border-bottom: 1px solid var(--line-faint);
 }
 
 .modal-list .dir-row:hover {
-    background: #0f3460;
+    background: var(--sunk);
+}
+
+/* A folder mark, so a row reads as a folder and not as text */
+.modal-list .dir-row::before {
+    content: "";
+    width: 12px;
+    height: 9px;
+    flex-shrink: 0;
+    border-radius: 1.5px;
+    background: var(--accent);
+    opacity: 0.8;
+}
+
+.modal-list .dir-row::after {
+    content: "\203A";
+    margin-left: auto;
+    color: var(--faint);
 }
 
 .modal-list .empty-row {
-    padding: 0.6rem;
-    color: #666;
-    font-size: 0.85rem;
+    padding: 16px;
+    color: var(--muted);
+    font-size: 12.5px;
 }
 
 .modal-actions {
     display: flex;
-    gap: 0.5rem;
-    justify-content: flex-end;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 16px;
+    border-top: 1px solid var(--line);
+    flex-shrink: 0;
+}
+
+.modal-actions .grow,
+.modal-actions .btn.primary {
+    margin-left: auto;
 }
 
 .size-box {
-    width: min(760px, 94vw);
-}
-
-.size-box .modal-list {
-    padding: 0.25rem 0.5rem;
+    width: min(720px, 94vw);
 }
 
 .size-box .storage-summary {
-    margin-bottom: 0.5rem;
+    margin: 0;
+    border: none;
+    border-bottom: 1px solid var(--line);
+    border-radius: 0;
 }
 
-/* Scrollbar */
-::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
+.size-box .modal-list {
+    border-top: none;
+    min-height: 160px;
 }
 
-::-webkit-scrollbar-track {
-    background: #1a1a2e;
+.size-box .storage-table td,
+.size-box .storage-table th {
+    padding: 0 16px;
 }
 
-::-webkit-scrollbar-thumb {
-    background: #0f3460;
-    border-radius: 4px;
-}
+/* ---------------------------------------------------------- help overlay */
 
-::-webkit-scrollbar-thumb:hover {
-    background: #e94560;
-}
-
-/* Help overlay */
 .help-overlay {
     position: fixed;
-    top: 0;
-    left: 0;
-    width: 100vw;
-    height: 100vh;
-    background: rgba(0,0,0,0.9);
+    inset: 0;
+    background: rgba(0,0,0,0.45);
     display: none;
     align-items: center;
     justify-content: center;
@@ -3446,78 +4237,124 @@ body {
 }
 
 .help-content {
-    background: #16213e;
-    border-radius: 12px;
-    padding: 2rem;
-    max-width: 700px;
-    max-height: 90vh;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: 0 24px 64px rgba(0,0,0,.35);
+    padding: 18px 22px 20px;
+    width: min(760px, 94vw);
+    max-height: 88vh;
     overflow-y: auto;
 }
 
 .help-content h2 {
-    color: #e94560;
-    margin-bottom: 1.5rem;
-    text-align: center;
-    font-size: 1.5rem;
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 14px;
+    color: var(--fg);
 }
 
 .help-columns {
     display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: 1.5rem;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 18px 28px;
 }
 
 .help-section h3 {
-    color: #4db5ff;
-    font-size: 0.9rem;
-    margin-bottom: 0.5rem;
-    border-bottom: 1px solid #0f3460;
-    padding-bottom: 0.3rem;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    padding-bottom: 6px;
+    margin-bottom: 6px;
+    border-bottom: 1px solid var(--line);
 }
 
 .help-row {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
-    padding: 0.25rem 0;
-    font-size: 0.85rem;
+    gap: 10px;
+    height: 26px;
+    font-size: 12.5px;
 }
 
-.help-row kbd {
-    background: #0f3460;
-    color: #e94560;
-    padding: 0.2rem 0.5rem;
-    border-radius: 4px;
-    font-family: monospace;
-    font-size: 0.8rem;
-    min-width: 28px;
+.help-row kbd,
+.help-hint kbd {
+    min-width: 22px;
     text-align: center;
-    font-weight: bold;
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--fg);
+    border: 1px solid var(--line-strong);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    padding: 1px 5px;
+    background: var(--bg);
+}
+
+.help-content h2 {
+    display: flex;
+    align-items: center;
+    gap: 10px;
 }
 
 .help-hint {
-    text-align: center;
-    color: #666;
-    margin-top: 1.5rem;
-    font-size: 0.85rem;
+    margin-left: auto;
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--muted);
+    white-space: nowrap;
 }
 
-.help-hint kbd {
-    background: #0f3460;
-    color: #e94560;
-    padding: 0.15rem 0.4rem;
-    border-radius: 3px;
-    font-family: monospace;
+/* -------------------------------------------------------------- scrollbar */
+
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
 }
 
-/* Responsive */
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--line-strong);
+    border-radius: 5px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--muted);
+    background-clip: padding-box;
+}
+
+/* ------------------------------------------------------------- responsive */
+
 @media (max-width: 768px) {
     .sidebar {
         display: none;
     }
 
     .file-grid {
-        grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+        grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+    }
+
+    .file-grid.list-view .file-item,
+    .list-head {
+        grid-template-columns: 36px minmax(0, 1fr) 90px 32px;
+    }
+
+    .file-grid.list-view .file-size { grid-column: 3; }
+    .file-grid.list-view .fav-toggle { grid-column: 4; }
+
+    .file-grid.list-view .file-kind,
+    .file-grid.list-view .file-date,
+    .list-head span:nth-child(3),
+    .list-head span:nth-child(5) {
+        display: none;
     }
 }'''
 
@@ -3566,6 +4403,8 @@ let batchView = null;        // B: {media, id} when the grid shows one import
 let batchNeedsRefresh = false; // ask the server to re-read the batch, not its cache
 let batchIndex = [];         // imports offered in the picker, newest first
 let gridMode = 'folder';     // what the grid holds right now: folder | recursive | batch
+let treeShown = true;        // T: the folder tree on the left
+let jobOpen = false;         // the job pill's popover
 let sizePath = '.';          // folder shown in the size dialog
 let sizeParent = null;
 
@@ -3586,6 +4425,10 @@ const lightboxInfoEl = document.getElementById('lightbox-info');
 const filterInput = document.getElementById('filter-input');
 const batchSelect = document.getElementById('batch-select');
 const batchBarEl = document.getElementById('batch-bar');
+const recursiveChipEl = document.getElementById('recursive-chip');
+const statusLeftEl = document.getElementById('status-left');
+const jobPillEl = document.getElementById('job-pill');
+const headerProgressEl = document.getElementById('header-progress');
 const clearFilterBtn = document.getElementById('btn-clear-filter');
 const jobBarEl = document.getElementById('job-bar');
 const batchListEl = document.getElementById('batch-list');
@@ -3602,6 +4445,26 @@ const dirPathEl = document.getElementById('dir-path');
 document.addEventListener('DOMContentLoaded', () => {
     loadTreeNode('.'); // Load root only
     loadDirectory('.', 1);
+
+    // Appearance
+    applyTheme(storedTheme() || 'dark');
+    try {
+        treeShown = localStorage.getItem('photoBrowserTree') !== '0';
+    } catch (err) { /* keep the default */ }
+    applyTreeShown();
+    document.getElementById('btn-theme').addEventListener('click', toggleTheme);
+    document.getElementById('btn-tree').addEventListener('click', toggleTree);
+    document.getElementById('btn-size').addEventListener('click', toggleSizeDialog);
+
+    // The job pill opens the detail popover
+    jobPillEl.addEventListener('click', () => {
+        jobOpen = !jobOpen;
+        jobBarEl.hidden = !jobOpen;
+    });
+
+    recursiveChipEl.addEventListener('click', (e) => {
+        if (e.target.closest('[data-exit-recursive]')) toggleRecursive(false);
+    });
 
     document.getElementById('btn-recursive').addEventListener('click', () => toggleRecursive());
     batchSelect.addEventListener('change', () => {
@@ -3653,6 +4516,10 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('btn-storage-refresh').addEventListener('click', () => loadStorage(storagePath, true));
     document.getElementById('btn-storage-up').addEventListener('click', () => {
         if (storageParent) loadStorage(storageParent);
+    });
+    document.getElementById('btn-storage-browse').addEventListener('click', () => {
+        setView('browse');
+        navigateTo(storagePath);
     });
     document.getElementById('storage-table').addEventListener('click', (e) => {
         const link = e.target.closest('[data-storage-path]');
@@ -3871,6 +4738,11 @@ document.addEventListener('DOMContentLoaded', () => {
             toggleSizeDialog();
             return;
         }
+        if (key === 't') {
+            e.preventDefault();
+            toggleTree();
+            return;
+        }
 
         // Tab to switch between panels
         if (e.key === 'Tab') {
@@ -3897,6 +4769,48 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 });
+
+// ---------------------------------------------------------------------------
+// Appearance: light / dark, and whether the folder tree is on screen
+// ---------------------------------------------------------------------------
+
+// Read before anything paints, so a light library never flashes dark
+function storedTheme() {
+    try {
+        return localStorage.getItem('photoBrowserTheme');
+    } catch (err) {
+        return null;   // private window, blocked storage - the default is fine
+    }
+}
+
+function applyTheme(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    const btn = document.getElementById('btn-theme');
+    if (btn) btn.title = theme === 'dark' ? 'Switch to light' : 'Switch to dark';
+}
+
+function toggleTheme() {
+    const next = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+    applyTheme(next);
+    try {
+        localStorage.setItem('photoBrowserTheme', next);
+    } catch (err) { /* nothing to persist to */ }
+}
+
+function applyTreeShown() {
+    if (sidebarEl) sidebarEl.hidden = !treeShown;
+    const btn = document.getElementById('btn-tree');
+    if (btn) btn.classList.toggle('active', treeShown);
+    if (!treeShown && focusedPanel === 'tree') setFocusedPanel('content');
+}
+
+function toggleTree() {
+    treeShown = !treeShown;
+    applyTreeShown();
+    try {
+        localStorage.setItem('photoBrowserTree', treeShown ? '1' : '0');
+    } catch (err) { /* nothing to persist to */ }
+}
 
 // Load a single tree node (lazy loading)
 async function loadTreeNode(path) {
@@ -4059,6 +4973,7 @@ function toggleRecursive(force) {
     recursiveMode = wanted;
     document.getElementById('btn-recursive').classList.toggle('active', recursiveMode);
     contentEl.classList.toggle('recursive', recursiveMode);
+    recursiveChipEl.hidden = !recursiveMode;
 
     // Leaving the flat view returns to where we were in the folder itself
     if (recursiveMode) {
@@ -4088,6 +5003,7 @@ function navigateTo(path) {
         recursiveMode = false;
         document.getElementById('btn-recursive').classList.remove('active');
         contentEl.classList.remove('recursive');
+        recursiveChipEl.hidden = true;
     }
     const saved = dirState.get(path);
     loadDirectory(path, saved ? saved.page : 1, saved || null);
@@ -4109,38 +5025,58 @@ function highlightItem(index) {
     items[index].classList.add('selected');
 }
 
-// Update file count display
+// What the grid holds, in two places: a short count next to the crumbs and
+// the fuller sentence in the status bar
 function updateFileCount(pag) {
+    const total = pag ? pag.total_files : allItems.filter(i => !i.is_dir).length;
+    const filtered = filterText ? getFilteredItems().length : null;
+
     if (batchView) {
-        const total = pag ? pag.total_files : allItems.length;
-        fileCountEl.textContent = filterText
-            ? `Filter: ${getFilteredItems().length} matches`
-            : `Files from this import: ${total.toLocaleString()}`;
+        setCounts(
+            filterText ? `${filtered} of ${total.toLocaleString()}` : `${total.toLocaleString()} files`,
+            filterText
+                ? `Filter: ${filtered} of ${total.toLocaleString()} files in this import`
+                : `Files from this import: ${total.toLocaleString()}`,
+            pag);
         return;
     }
 
     if (recursiveMode) {
-        const total = pag ? pag.total_files : allItems.length;
         const where = currentPath === '.' ? 'the library' : currentPath;
-        fileCountEl.textContent = filterText
-            ? `Filter: ${getFilteredItems().length} matches`
-            : `All photos below ${where}: ${total.toLocaleString()}`;
+        setCounts(
+            filterText ? `${filtered} of ${total.toLocaleString()}` : `${total.toLocaleString()} files`,
+            filterText
+                ? `Filter: ${filtered} of ${total.toLocaleString()} below ${where}`
+                : `All photos below ${where}: ${total.toLocaleString()}`,
+            pag);
         return;
     }
 
     const dirCount = pag ? pag.total_dirs : allItems.filter(i => i.is_dir).length;
-    const fileCount = pag ? pag.total_files : allItems.filter(i => !i.is_dir).length;
-    const showingStart = pag ? (pag.page - 1) * pag.per_page + 1 : 1;
-    const showingEnd = pag ? Math.min(pag.page * pag.per_page, pag.total_files) : fileCount;
+    const folders = dirCount === 1 ? '1 folder' : `${dirCount.toLocaleString()} folders`;
+    const files = total === 1 ? '1 file' : `${total.toLocaleString()} files`;
 
     if (filterText) {
-        const filtered = getFilteredItems();
-        fileCountEl.textContent = `Filter: ${filtered.length} matches`;
-    } else if (pag && pag.total_files > pag.per_page) {
-        fileCountEl.textContent = `${dirCount} folders | Showing ${showingStart}-${showingEnd} of ${pag.total_files} files`;
-    } else {
-        fileCountEl.textContent = `${dirCount} folders, ${fileCount} files`;
+        setCounts(`${filtered} of ${total.toLocaleString()}`, `Filter: ${filtered} matches`, pag);
+        return;
     }
+
+    setCounts(dirCount ? `${folders}, ${files}` : files, `${folders}, ${files}`, pag);
+}
+
+// The status bar also says which slice of the files is on screen
+function setCounts(shortText, longText, pag) {
+    fileCountEl.textContent = shortText;
+    if (!statusLeftEl) return;
+
+    if (!filterText && pag && pag.total_pages > 1) {
+        const from = (pag.page - 1) * pag.per_page + 1;
+        const to = Math.min(pag.page * pag.per_page, pag.total_files);
+        statusLeftEl.textContent = `${longText} - showing ${from.toLocaleString()}-${to.toLocaleString()}`;
+        return;
+    }
+
+    statusLeftEl.textContent = longText;
 }
 
 // Get filtered items
@@ -4189,8 +5125,8 @@ function batchOptionLabel(batch) {
     const when = formatBatchDate(batch.imported_at);
     const kind = batch.media === 'video' ? 'videos' : 'photos';
     const parts = (batch.source_directory || '').split('/').filter(Boolean);
-    const source = parts.slice(-2).join('/') || batch.source_directory;
-    return `${when} - ${(batch.copied || 0).toLocaleString()} ${kind} - ${source}`;
+    const source = parts.length ? parts[parts.length - 1] : batch.source_directory;
+    return `#${batch.id} \u00b7 ${when} \u00b7 ${(batch.copied || 0).toLocaleString()} ${kind} \u00b7 ${source}`;
 }
 
 function formatBatchDate(value) {
@@ -4199,7 +5135,7 @@ function formatBatchDate(value) {
 
 function renderBatchOptions() {
     const selected = batchView ? `${batchView.media}:${batchView.id}` : '';
-    let html = '<option value="">All folders</option>';
+    let html = '<option value="">Imports</option>';
 
     for (const batch of batchIndex) {
         const value = `${batch.media}:${batch.id}`;
@@ -4218,6 +5154,7 @@ function enterBatchView(mediaType, batchId) {
         recursiveMode = false;
         document.getElementById('btn-recursive').classList.remove('active');
         contentEl.classList.remove('recursive');
+        recursiveChipEl.hidden = true;
     } else {
         rememberDirState();   // keep the folder's own spot for the way back
     }
@@ -4247,7 +5184,7 @@ function exitBatchView(reload = true) {
     }
 }
 
-// The strip above the grid: which import this is, and what it could not show
+// The chip in the path bar: which import this is, and what it could not show
 function renderBatchBar(info) {
     if (!info) {
         batchBarEl.hidden = true;
@@ -4256,42 +5193,54 @@ function renderBatchBar(info) {
     }
 
     const kind = info.media === 'video' ? 'videos' : 'photos';
-    let html = `<span><b>Import #${info.id}</b> - ${kind}</span>`;
-    html += `<span>${escapeHtml(formatBatchDate(info.imported_at))}</span>`;
-    html += `<span><b>${(info.shown || 0).toLocaleString()}</b> files</span>`;
+    const paths = `${info.source_directory} \u2192 ${info.target_directory}`;
 
+    let html = `<b>Import #${info.id}</b>`;
+    html += `<span class="mono">${escapeHtml(formatBatchDate(info.imported_at))}</span>`;
+    html += `<span class="mono">${(info.shown || 0).toLocaleString()} ${kind}</span>`;
+
+    // Files the import put somewhere this grid cannot reach
+    const gaps = [];
+    const detail = [];
     if (info.missing) {
-        html += `<span class="warn">${info.missing.toLocaleString()} no longer on disk</span>`;
+        gaps.push(`${info.missing.toLocaleString()} missing`);
+        detail.push(`${info.missing.toLocaleString()} no longer on disk`);
     }
     if (info.outside) {
-        html += `<span class="warn">${info.outside.toLocaleString()} outside the served folder</span>`;
+        gaps.push(`${info.outside.toLocaleString()} elsewhere`);
+        detail.push(`${info.outside.toLocaleString()} outside the served folder`);
+    }
+    if (gaps.length) {
+        html += `<span class="mono warn" title="${escapeHtml(detail.join(' - '))}">${escapeHtml(gaps.join(' - '))}</span>`;
     }
 
-    const paths = `${info.source_directory} \u2192 ${info.target_directory}`;
-    html += `<span class="batch-bar-paths" title="${escapeHtml(paths)}">${escapeHtml(paths)}</span>`;
-    html += `<button class="btn" data-exit-batch="1">Show all folders</button>`;
+    html += `<span class="chip-paths" title="${escapeHtml(paths)}">${escapeHtml(paths)}</span>`;
+    html += `<button class="chip-close" data-exit-batch="1" title="Show all folders">\u00d7</button>`;
 
     batchBarEl.innerHTML = html;
     batchBarEl.hidden = false;
 }
 
 function renderBatchBreadcrumb(info) {
-    const label = info
-        ? `Import #${info.id} - ${formatBatchDate(info.imported_at)}`
-        : 'Import';
-    breadcrumbEl.innerHTML = `<a href="#" data-path=".">Home</a>`
-        + `<span class="separator">/</span><span>${escapeHtml(label)}</span>`;
+    breadcrumbEl.innerHTML = `<a href="#" data-path=".">${escapeHtml(libraryName())}</a>`;
+}
+
+// The library's own folder name reads better than a generic "Home"
+function libraryName() {
+    const parts = (serverConfig.root || '').split('/').filter(Boolean);
+    const name = parts.length ? parts[parts.length - 1] : '';
+    return name && name !== '.' ? name : 'Home';
 }
 
 // Render breadcrumb navigation
 function renderBreadcrumb(path) {
     const parts = path === '.' ? [] : path.split('/');
-    let html = `<a href="#" data-path=".">Home</a>`;
+    let html = `<a href="#" data-path=".">${escapeHtml(libraryName())}</a>`;
 
     let currentPath = '';
     for (const part of parts) {
         currentPath += (currentPath ? '/' : '') + part;
-        html += `<span class="separator">/</span>`;
+        html += `<span class="separator">\u203A</span>`;
         html += `<a href="#" data-path="${escapeHtml(currentPath)}">${escapeHtml(part)}</a>`;
     }
 
@@ -4316,7 +5265,7 @@ function renderPagination(pag) {
     let html = '';
 
     // Previous button
-    html += `<button class="page-btn" ${pag.page <= 1 ? 'disabled' : ''} data-page="${pag.page - 1}" data-shortcut="[" title="Previous page ([)">&laquo; Prev</button>`;
+    html += `<button class="page-btn" ${pag.page <= 1 ? 'disabled' : ''} data-page="${pag.page - 1}" data-shortcut="[" title="Previous page ([)">\u2039</button>`;
 
     // Page numbers with ellipsis
     const maxVisible = 7;
@@ -4356,10 +5305,7 @@ function renderPagination(pag) {
     }
 
     // Next button
-    html += `<button class="page-btn" ${pag.page >= pag.total_pages ? 'disabled' : ''} data-page="${pag.page + 1}" data-shortcut="]" title="Next page (])">Next &raquo;</button>`;
-
-    // Page info
-    html += `<span class="page-info">Page ${pag.page} of ${pag.total_pages}</span>`;
+    html += `<button class="page-btn" ${pag.page >= pag.total_pages ? 'disabled' : ''} data-page="${pag.page + 1}" data-shortcut="]" title="Next page (])">\u203A</button>`;
 
     paginationEl.innerHTML = html;
 }
@@ -4380,22 +5326,57 @@ function renderFiles(items, targetEl) {
     const grid = targetEl || fileGridEl;
     let html = '';
 
+    // The list view is a table, so it gets a header row the grid never shows
+    if (grid === fileGridEl && items.length) {
+        html += `<div class="list-head">`
+            + `<span></span><span>Name</span><span>Kind</span>`
+            + `<span>Size</span><span>Modified</span><span></span></div>`;
+    }
+
     for (const item of items) {
         html += renderFileItem(item);
     }
 
-    grid.innerHTML = html || '<div class="empty">No files in this directory</div>';
+    grid.innerHTML = html || '<div class="empty">Nothing here.</div>';
+}
+
+// Columns the list view shows and the grid hides
+function fileColumns(item) {
+    if (item.is_dir) {
+        return `<span class="file-kind">Folder</span><span class="file-size"></span>`
+             + `<span class="file-date">${escapeHtml(formatStamp(item.modified))}</span>`;
+    }
+
+    const kind = item.is_video ? 'Video'
+        : item.is_raw ? ((item.extension || '').replace('.', '').toUpperCase() || 'RAW')
+        : item.is_image ? ((item.extension || '').replace('.', '').toUpperCase() || 'Image')
+        : 'File';
+
+    return `<span class="file-kind">${escapeHtml(kind)}</span>`
+         + `<span class="file-size">${item.missing ? '' : formatSize(item.size || 0)}</span>`
+         + `<span class="file-date">${escapeHtml(formatStamp(item.modified))}</span>`;
+}
+
+// Seconds since the epoch, as the list view prints them
+function formatStamp(seconds) {
+    if (!seconds) return '';
+    const date = new Date(seconds * 1000);
+    if (isNaN(date.getTime())) return '';
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+         + `${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 function renderFileItem(item) {
     const path = escapeHtml(item.path);
     const name = escapeHtml(item.name);
+    const cols = fileColumns(item);
 
     if (item.is_dir) {
         return `
             <div class="file-item folder" data-path="${path}">
                 <div class="file-icon">&#128193;</div>
-                <div class="file-name">${name}</div>
+                <div class="file-name">${name}</div>${cols}
             </div>
         `;
     }
@@ -4417,7 +5398,7 @@ function renderFileItem(item) {
         return `
             <div class="file-item image${missing}" data-path="${path}">
                 ${thumb}${star}
-                <div class="file-name">${name}</div>${sub}
+                <div class="file-name">${name}</div>${sub}${cols}
             </div>
         `;
     }
@@ -4426,7 +5407,7 @@ function renderFileItem(item) {
         return `
             <div class="file-item video${missing}" data-path="${path}">
                 <div class="video-icon">&#9658;</div>${star}
-                <div class="file-name">${name}</div>${sub}
+                <div class="file-name">${name}</div>${sub}${cols}
             </div>
         `;
     }
@@ -4436,7 +5417,7 @@ function renderFileItem(item) {
         return `
             <div class="file-item raw${missing}" data-path="${path}">
                 <div class="raw-icon">${escapeHtml(kind || 'RAW')}</div>${star}
-                <div class="file-name">${name}</div>${sub}
+                <div class="file-name">${name}</div>${sub}${cols}
             </div>
         `;
     }
@@ -4444,7 +5425,7 @@ function renderFileItem(item) {
     return `
         <div class="file-item${missing}" data-path="${path}">
             <div class="file-icon">&#128196;</div>${star}
-            <div class="file-name">${name}</div>
+            <div class="file-name">${name}</div>${cols}
         </div>
     `;
 }
@@ -4539,7 +5520,22 @@ function showMedia(path) {
         lightboxImgEl.src = `/photo/${encodeURIComponent(path)}`;
     }
 
-    lightboxInfoEl.textContent = item ? `${item.name} (${formatSize(item.size)})` : path;
+    const nameEl = document.getElementById('lightbox-name');
+    const indexEl = document.getElementById('lightbox-index');
+    if (nameEl) nameEl.textContent = item ? item.name : path.split('/').pop();
+    if (indexEl) {
+        indexEl.textContent = media.length
+            ? `${currentImageIndex + 1} / ${media.length}`
+            : '';
+    }
+
+    // Size, date and folder along the bottom
+    const folder = path.split('/').slice(0, -1).join('/');
+    const parts = [];
+    if (item) parts.push(formatSize(item.size));
+    if (item && item.modified) parts.push(formatStamp(item.modified));
+    if (folder) parts.push(folder);
+    lightboxInfoEl.textContent = parts.join('   \u00b7   ');
 }
 
 function prevImage() {
@@ -4698,6 +5694,11 @@ function setFocusedPanel(panel) {
 }
 
 function switchFocusedPanel() {
+    // With the tree hidden (T) there is only one panel to drive
+    if (!treeShown) {
+        setFocusedPanel('content');
+        return;
+    }
     setFocusedPanel(focusedPanel === 'tree' ? 'content' : 'tree');
 }
 
@@ -4877,6 +5878,7 @@ async function initManage() {
     });
 
     updateFavoriteCount(serverConfig.favorites || 0);
+    if (!batchView) renderBreadcrumb(currentPath);
 
     if (!serverConfig.import_enabled) {
         document.querySelectorAll('.import-only').forEach(el => el.classList.add('hidden'));
@@ -4889,19 +5891,23 @@ async function initManage() {
         // Checksums are slow for videos - the CLI defaults them off there
         document.getElementById('scan-checksum').checked = media === 'photo';
     });
-    bindSegmented('quick-copy-media', (media) => { copyMedia = media; });
+    bindSegmented('quick-copy-media', (media) => { copyMedia = media; loadLatestBatch(); });
     bindSegmented('batches-media', (media) => { batchesMedia = media; loadBatches(); });
 
     // Actions
     document.getElementById('btn-scan').addEventListener('click', startScan);
     document.getElementById('btn-quick-copy').addEventListener('click', startQuickCopy);
+    document.getElementById('btn-all-batches').addEventListener('click', () => setView('batches'));
     document.getElementById('btn-expand').addEventListener('click', startExpand);
     document.getElementById('btn-refresh-batches').addEventListener('click', loadBatches);
     document.getElementById('btn-refresh-jobs').addEventListener('click', () => renderJobHistory(latestJobs));
     document.getElementById('job-cancel').addEventListener('click', cancelWatchedJob);
     document.getElementById('job-dismiss').addEventListener('click', () => {
         dismissedJobId = watchedJobId;
+        jobOpen = false;
         jobBarEl.hidden = true;
+        jobPillEl.hidden = true;
+        headerProgressEl.hidden = true;
     });
 
     const importHereBtn = document.getElementById('btn-import-here');
@@ -4993,6 +5999,7 @@ function setView(view) {
         el.classList.toggle('active', el.id === `view-${view}`);
     });
 
+    if (view === 'import') loadLatestBatch();
     if (view === 'batches') loadBatches();
     if (view === 'tools') renderJobHistory(latestJobs);
     if (view === 'favorites') loadFavorites();
@@ -5180,10 +6187,27 @@ function refreshBrowseAfterJob() {
 function renderJobBar(job) {
     if (!job || job.id === dismissedJobId) {
         jobBarEl.hidden = true;
+        jobPillEl.hidden = true;
+        headerProgressEl.hidden = true;
+        jobOpen = false;
         return;
     }
 
-    jobBarEl.hidden = false;
+    const percent = job.status === 'running' ? job.percent : 100;
+
+    // The pill is always there while a job is worth showing; the panel below
+    // it only when asked for
+    jobPillEl.hidden = false;
+    document.getElementById('job-pill-title').textContent = job.title;
+    document.getElementById('job-pill-fill').style.width = `${percent}%`;
+    document.getElementById('job-pill-meta').textContent = job.status === 'running'
+        ? `${percent}% - ${formatSeconds(job.elapsed_seconds)}`
+        : job.status;
+
+    headerProgressEl.hidden = job.status !== 'running';
+    headerProgressEl.style.width = `${percent}%`;
+
+    jobBarEl.hidden = !jobOpen;
     document.getElementById('job-title').textContent = job.title;
 
     const badge = document.getElementById('job-badge');
@@ -5201,6 +6225,12 @@ function renderJobBar(job) {
 
     document.getElementById('job-cancel').style.display = running ? '' : 'none';
     document.getElementById('job-result').textContent = describeJobResult(job);
+
+    // A job that just ended has something to say - open the panel once
+    if (!running && lastWatchedStatus === 'running') {
+        jobOpen = true;
+        jobBarEl.hidden = false;
+    }
 }
 
 function describeJobResult(job) {
@@ -5237,27 +6267,59 @@ function renderJobHistory(jobs) {
 
     jobHistoryEl.innerHTML = jobs.map(job => `
         <div class="job-row">
-            <span class="job-badge ${job.status}">${escapeHtml(job.status)}</span>
+            <span><span class="job-badge ${job.status}">${escapeHtml(job.status)}</span></span>
             <span class="grow">${escapeHtml(job.title)}</span>
-            <span>${escapeHtml(job.started_at.replace('T', ' '))}</span>
-            <span>${formatSeconds(job.elapsed_seconds)}</span>
+            <span class="when">${escapeHtml((job.started_at || '').replace('T', ' '))}</span>
+            <span class="elapsed">${formatSeconds(job.elapsed_seconds)}</span>
         </div>
     `).join('');
 }
 
 function renderServerInfo() {
-    document.getElementById('server-info').innerHTML = `
-        <div>Serving: ${escapeHtml(serverConfig.root || '')}</div>
-        <div>Photo database: ${escapeHtml(serverConfig.db_path || '')}</div>
-        <div>Video database: ${escapeHtml(serverConfig.video_db_path || '')}</div>
-        <div>Default workers: ${serverConfig.default_workers}</div>
-        <div>Thumbnails (Pillow): ${serverConfig.has_pil ? 'available' : 'not installed'}</div>
-    `;
+    const thumbs = serverConfig.has_pil
+        ? `available${serverConfig.has_heif ? ' \u00b7 HEIC supported' : ''}`
+        : 'not installed';
+
+    const rows = [
+        ['Serving', serverConfig.root || ''],
+        ['Photo database', serverConfig.db_path || ''],
+        ['Video database', serverConfig.video_db_path || ''],
+        ['Default workers', String(serverConfig.default_workers || '')],
+        ['Thumbnails (Pillow)', thumbs],
+    ];
+
+    document.getElementById('server-info').innerHTML = rows.map(([label, value]) =>
+        `<div class="label">${escapeHtml(label)}</div><div>${escapeHtml(value)}</div>`
+    ).join('');
 }
 
 // ---------------------------------------------------------------------------
 // Batches
 // ---------------------------------------------------------------------------
+
+// The Import tab says which batch "Copy latest batch" would actually run on
+async function loadLatestBatch() {
+    const el = document.getElementById('latest-batch');
+    if (!el || !serverConfig.import_enabled) return;
+
+    try {
+        const data = await api('GET', `/api/batches?media=${copyMedia}&limit=1`);
+        const batch = (data.batches || [])[0];
+        if (!batch) {
+            el.innerHTML = '<span class="source">No batch yet - scan a source first.</span>';
+            return;
+        }
+
+        const stats = batch.stats || {};
+        el.innerHTML = `
+            <span class="batch-id">#${batch.id}</span>
+            <span class="batch-status ${escapeHtml(batch.status)}">${escapeHtml(batch.status)}</span>
+            <span class="source" title="${escapeHtml(batch.source_directory)}">${escapeHtml(batch.source_directory)}</span>
+            <span class="pending">${(stats.pending || 0).toLocaleString()} pending</span>`;
+    } catch (err) {
+        el.innerHTML = '';   // the card still works without it
+    }
+}
 
 async function loadBatches() {
     batchListEl.innerHTML = '<div class="loading-indicator">Loading...</div>';
@@ -5279,25 +6341,34 @@ function renderBatches(batches) {
         const stats = batch.stats || {};
         const dated = stats.with_exif !== undefined ? stats.with_exif : (stats.with_metadata || 0);
         const datedLabel = batchesMedia === 'video' ? 'With metadata' : 'With EXIF';
+        const paths = `${batch.source_directory} \u2192 ${batch.target_directory}`;
+
+        // One bar for how the batch ended up: copied, skipped, conflicts, failed
+        const total = stats.total || 0;
+        const share = (n) => total ? `${((n || 0) / total) * 100}%` : '0';
 
         return `
         <div class="batch" data-id="${batch.id}">
             <div class="batch-head">
-                <span class="batch-id">Batch #${batch.id}</span>
+                <span class="batch-id">#${batch.id}</span>
                 <span class="batch-status ${escapeHtml(batch.status)}">${escapeHtml(batch.status)}</span>
-                <span class="card-hint" style="margin:0">${escapeHtml((batch.started_at || '').replace('T', ' '))}</span>
+                <span class="batch-when">${escapeHtml((batch.started_at || '').replace('T', ' '))}</span>
+                <span class="batch-paths" title="${escapeHtml(paths)}">${escapeHtml(paths)}</span>
             </div>
-            <div class="batch-paths">
-                ${escapeHtml(batch.source_directory)} &rarr; ${escapeHtml(batch.target_directory)}
+            <div class="batch-mix" title="copied / skipped / conflicts / failed">
+                <span class="mix-copied" style="width:${share(stats.copied)}"></span>
+                <span class="mix-skipped" style="width:${share(stats.skipped)}"></span>
+                <span class="mix-conflicts" style="width:${share(stats.conflicts)}"></span>
+                <span class="mix-failed" style="width:${share(stats.failed)}"></span>
             </div>
             <div class="batch-stats">
-                <span>Total <b>${stats.total || 0}</b></span>
-                <span>Pending <b>${stats.pending || 0}</b></span>
-                <span>Copied <b>${stats.copied || 0}</b></span>
-                <span>Skipped <b>${stats.skipped || 0}</b></span>
-                <span>Failed <b>${stats.failed || 0}</b></span>
-                <span>Conflicts <b>${stats.conflicts || 0}</b></span>
-                <span>${datedLabel} <b>${dated}</b></span>
+                <span>Total <b>${(stats.total || 0).toLocaleString()}</b></span>
+                <span>Pending <b>${(stats.pending || 0).toLocaleString()}</b></span>
+                <span>Copied <b>${(stats.copied || 0).toLocaleString()}</b></span>
+                <span>Skipped <b>${(stats.skipped || 0).toLocaleString()}</b></span>
+                <span>Failed <b class="${stats.failed ? 'bad' : ''}">${(stats.failed || 0).toLocaleString()}</b></span>
+                <span>Conflicts <b class="${stats.conflicts ? 'warn' : ''}">${(stats.conflicts || 0).toLocaleString()}</b></span>
+                <span>${datedLabel} <b>${(dated || 0).toLocaleString()}</b></span>
                 <span>Size <b>${formatSize(stats.total_size || 0)}</b></span>
             </div>
             <div class="batch-actions">
@@ -5305,7 +6376,7 @@ function renderBatches(batches) {
                     ${stats.pending ? '' : 'disabled'}>Copy ${stats.pending || 0} pending</button>
                 <button class="btn" data-action="dry" data-id="${batch.id}"
                     ${stats.pending ? '' : 'disabled'}>Dry run</button>
-                <button class="btn" data-action="conflicts" data-id="${batch.id}"
+                <button class="btn warn" data-action="conflicts" data-id="${batch.id}"
                     ${stats.conflicts ? '' : 'disabled'}>Review ${stats.conflicts || 0} conflicts</button>
                 <button class="btn" data-action="retry" data-id="${batch.id}"
                     ${stats.failed ? '' : 'disabled'}>Retry ${stats.failed || 0} failed</button>
@@ -5313,7 +6384,7 @@ function renderBatches(batches) {
                     ${stats.failed ? '' : 'disabled'}>Show failed</button>
                 <button class="btn" data-action="files" data-id="${batch.id}"
                     ${stats.copied ? '' : 'disabled'}>Show ${stats.copied || 0} imported files</button>
-                <button class="btn" data-action="browse" data-id="${batch.id}"
+                <button class="btn ghost" data-action="browse" data-id="${batch.id}"
                     data-path="${escapeHtml(batch.target_directory)}">Open target</button>
             </div>
             <div class="batch-failed" id="failed-${batch.id}" hidden></div>
@@ -5734,15 +6805,15 @@ function renderConflict(conflict) {
             <div class="conflict-head">
                 <span class="conflict-name">${escapeHtml(conflict.filename)}</span>
                 ${badge}
+                <div class="conflict-actions">
+                    <button class="btn" data-action="skip" data-id="${conflict.id}">Keep existing</button>
+                    <button class="btn" data-action="keep_both" data-id="${conflict.id}">Keep both</button>
+                    <button class="btn danger" data-action="overwrite" data-id="${conflict.id}">Replace</button>
+                </div>
             </div>
             <div class="conflict-sides">
                 ${renderConflictSide('Imported (new)', conflict.incoming)}
                 ${renderConflictSide('Already in library', conflict.existing)}
-            </div>
-            <div class="conflict-actions">
-                <button class="btn" data-action="skip" data-id="${conflict.id}">Keep existing</button>
-                <button class="btn" data-action="keep_both" data-id="${conflict.id}">Keep both</button>
-                <button class="btn danger" data-action="overwrite" data-id="${conflict.id}">Replace with imported</button>
             </div>
         </div>
     `;
@@ -5754,7 +6825,9 @@ function renderConflictSide(title, side) {
             <div class="conflict-side">
                 <h4>${escapeHtml(title)}</h4>
                 <div class="no-preview">File is missing</div>
-                <div class="conflict-meta">${escapeHtml(side && side.path ? side.path : 'unknown path')}</div>
+                <div class="conflict-meta">
+                    <span>Path</span><b>${escapeHtml(side && side.path ? side.path : 'unknown path')}</b>
+                </div>
             </div>
         `;
     }
@@ -5765,17 +6838,19 @@ function renderConflictSide(title, side) {
            <div class="no-preview" hidden>No preview for this format</div>`
         : '<div class="no-preview">No preview (video or unsupported format)</div>';
 
-    const taken = side.taken_at ? `<div>Taken: <b>${escapeHtml(side.taken_at.replace('T', ' '))}</b></div>` : '';
+    const taken = side.taken_at
+        ? `<span>Taken</span><b>${escapeHtml(side.taken_at.replace('T', ' '))}</b>`
+        : '';
 
     return `
         <div class="conflict-side">
             <h4>${escapeHtml(title)}</h4>
             ${preview}
             <div class="conflict-meta">
-                <div>Size: <b>${formatSize(side.size)}</b></div>
+                <span>Size</span><b>${formatSize(side.size)}</b>
                 ${taken}
-                <div>Modified: ${escapeHtml(side.modified.replace('T', ' '))}</div>
-                <div>${escapeHtml(side.path)}</div>
+                <span>Modified</span><b>${escapeHtml(side.modified.replace('T', ' '))}</b>
+                <span>Path</span><b>${escapeHtml(side.path)}</b>
             </div>
         </div>
     `;

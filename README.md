@@ -99,7 +99,16 @@ Tabs in the UI:
 
 Notes:
 
-- A progress bar at the top shows the running job (file counter, elapsed time) and can stop it - progress is saved exactly like a `Ctrl+C` in the CLI, so re-running resumes.
+- The UI is dark by default and has a light side; the ◐ button in the top right
+  switches between them and remembers the choice in the browser.
+- A running job shows as a pill in the top bar (name, progress, elapsed); click
+  it for the detail panel with the current file, counts and **Stop**. Progress is
+  saved exactly like a `Ctrl+C` in the CLI, so re-running resumes.
+- The bar above the grid holds the breadcrumbs and whatever is narrowing the
+  grid; the bar below it holds the file count, the pages and how many items to
+  show. **T** hides the folder tree when the grid wants the room.
+- **List** (**L**) is a real table - name, kind, size and modified date - and
+  **Grid** (**G**) is the thumbnail wall.
 - One job runs at a time; starting a second one returns a "still running" error.
 - Source and target folders can be typed or picked with the **Browse** button, which walks the local filesystem, and **Current** fills in the folder currently open in the Browse tab.
 - The line under the target field spells out the exact destination (`.../organized_photos/YYYY/MM/DD/`) before anything is copied.
@@ -107,12 +116,12 @@ Notes:
 - The server uses the databases passed to the command: `photo-import --db my.db --video-db my_video.db serve ...`.
 - **S** opens a size dialog for whatever is selected in the hierarchy - the folder focused in the tree, otherwise the folder tile selected in the grid, otherwise the folder you are in. It shows the total size, photo/RAW/video counts and a per-subfolder table you can drill into; **Open in Storage** hands it over to the full view.
 - The **import picker** in the toolbar (**B**) lists every import that copied
-  files, newest first - `2024-07-14 18:20 - 412 photos - card_b/DCIM`. Pick one
+  files, newest first - `#8 - 2024-07-14 18:20 - 412 photos - 100MSDCF`. Pick one
   and the grid shows only that batch's files, wherever they landed in the tree,
-  with the folder printed under each tile. **Show all folders** (or **B** again,
-  or clicking any folder) goes back to where you were. The strip above the grid
-  counts files that were deleted after the import and files that landed outside
-  the served folder. **Batches - Show N imported files** opens the same view.
+  with the folder printed under each tile. A chip in the path bar names the
+  import and counts what it cannot show - files deleted since, and files that
+  landed outside the served folder; the × on it (or **B** again, or clicking any
+  folder) goes back to where you were. **Batches - Show N imported files** opens the same view.
 - **V** flattens a year, month or day into one thumbnail grid - every photo below it, paginated, with the folder printed under each tile. Press **V** again (or walk to another folder) to go back to the normal listing.
 - RAW files (`.arw`, `.orf`, `.cr2`, `.nef`, `.dng`, ...) are listed and counted as photos, shown with a RAW tile instead of a thumbnail - Pillow cannot render them.
 - **Storage** measures every subfolder of the one you are looking at, so opening it on `organized_photos` gives the per-year breakdown. Results are cached until you press **Rescan**.
