@@ -5848,13 +5848,37 @@ function selectTreeItem(index, folders) {
     focusedFolder.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
 
-// Click handlers to set panel focus
-sidebarEl.addEventListener('click', () => {
+// Clicking somewhere is also saying "carry on from here" - without this the
+// focus ring stays where the keyboard left it and the next arrow key jumps
+// back to the old spot
+sidebarEl.addEventListener('click', (e) => {
+    const folder = e.target.closest('.tree-folder');
+    if (folder) {
+        const index = getVisibleTreeFolders().indexOf(folder);
+        if (index >= 0) focusedTreeIndex = index;
+    }
     setFocusedPanel('tree');
 });
 
-fileGridEl.addEventListener('click', () => {
+fileGridEl.addEventListener('click', (e) => {
+    const item = e.target.closest('.file-item');
+    if (item) {
+        const index = [...fileGridEl.querySelectorAll('.file-item')].indexOf(item);
+        if (index >= 0) selectedIndex = index;
+    }
     setFocusedPanel('content');
+}, true);
+
+// The favorites grid keeps its own tiles but shares the selection the * key uses
+favoritesGridEl.addEventListener('click', (e) => {
+    const item = e.target.closest('.file-item');
+    if (!item) return;
+    const index = [...favoritesGridEl.querySelectorAll('.file-item')].indexOf(item);
+    if (index < 0) return;
+
+    favoritesGridEl.querySelectorAll('.file-item.selected').forEach(el => el.classList.remove('selected'));
+    item.classList.add('selected');
+    selectedIndex = index;
 }, true);
 
 // ===========================================================================
