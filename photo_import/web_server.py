@@ -82,6 +82,8 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
             self.send_conflicts(query)
         elif path == '/api/preview':
             self.send_preview(query)
+        elif path == '/api/exif':
+            self.send_exif(query)
         elif path == '/api/list':
             dir_path = query.get('path', ['.'])[0]
             self.send_file_list(dir_path)
@@ -930,6 +932,49 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
             },
         })
 
+    def send_exif(self, query: dict):
+        """What the camera wrote into one photo, for the lightbox panel."""
+        from .exif_reader import read_exif_summary
+
+        relative_path = query.get('path', [''])[0]
+        if not relative_path:
+            self.send_json({"error": "path is required"}, 400)
+            return
+
+        root = Path(self.root_directory).resolve()
+        full_path = root / relative_path
+
+        # Containment first, then touch the file
+        try:
+            full_path.resolve().relative_to(root)
+        except ValueError:
+            self.send_json({"error": "Access denied"}, 403)
+            return
+
+        if not full_path.is_file():
+            self.send_json({"error": "File not found"}, 404)
+            return
+
+        stat = full_path.stat()
+        cache_key = (str(full_path), stat.st_mtime)
+        summary = EXIF_CACHE.get(cache_key)
+        if summary is None:
+            summary = read_exif_summary(full_path)
+            while len(EXIF_CACHE) >= 64:
+                EXIF_CACHE.pop(next(iter(EXIF_CACHE)))
+            EXIF_CACHE[cache_key] = summary
+
+        self.send_json({
+            "path": relative_path,
+            "name": full_path.name,
+            "extension": full_path.suffix.lower(),
+            "size": stat.st_size,
+            "modified": stat.st_mtime,
+            "fields": summary["fields"],
+            "tags": summary["tags"],
+            "source": summary["source"],
+        })
+
     def send_image_list(self, relative_path: str):
         """Send list of images in a directory."""
         images = list_images_in_directory(self.root_directory, relative_path)
@@ -1117,6 +1162,8 @@ MAX_COMPARE_BYTES = 512 * 1024 * 1024
 STATS_CACHE: dict = {}
 RECURSIVE_CACHE: dict = {}
 BATCH_CACHE: dict = {}
+# Keyed on path and mtime - re-reading a 50 MB RAW on every arrow key is felt
+EXIF_CACHE: dict = {}
 
 # A guard against pointing the flat view at something enormous
 MAX_RECURSIVE_ITEMS = 200_000
@@ -1820,6 +1867,7 @@ def get_index_html() -> str:
             <div class="lightbox-top">
                 <span class="lightbox-name" id="lightbox-name"></span>
                 <span class="lightbox-index" id="lightbox-index"></span>
+                <button class="lightbox-btn" id="lightbox-exif" title="Photo info (I)">&#9432;</button>
                 <button class="lightbox-fav" id="lightbox-fav" title="Favorite (*)">&#9734;</button>
                 <button class="lightbox-close" id="lightbox-close" title="Close (Esc)">&times;</button>
             </div>
@@ -1828,6 +1876,7 @@ def get_index_html() -> str:
                 <img id="lightbox-img" src="" alt="">
                 <video id="lightbox-video" controls style="display:none;"></video>
                 <button class="lightbox-nav lightbox-next" id="lightbox-next" title="Next (&rarr;)">&rsaquo;</button>
+                <aside class="exif-panel" id="exif-panel" hidden></aside>
             </div>
             <div class="lightbox-info" id="lightbox-info"></div>
         </div>
@@ -1903,6 +1952,7 @@ def get_index_html() -> str:
                         <div class="help-row"><kbd>F</kbd> Focus filter</div>
                         <div class="help-row"><kbd>V</kbd> All photos below folder</div>
                         <div class="help-row"><kbd>B</kbd> Files of one import</div>
+                        <div class="help-row"><kbd>I</kbd> Photo info (EXIF)</div>
                         <div class="help-row"><kbd>S</kbd> Size of selected folder</div>
                         <div class="help-row"><kbd>*</kbd> Favorite selected item</div>
                     </div>
@@ -2200,7 +2250,7 @@ body {
 }
 
 .tree-folder.has-children::before {
-    content: "\\203A";
+    content: "›";
     width: 14px;
     flex-shrink: 0;
     text-align: center;
@@ -2995,7 +3045,8 @@ select.btn {
 }
 
 .lightbox-close,
-.lightbox-fav {
+.lightbox-fav,
+.lightbox-btn {
     width: 32px;
     height: 32px;
     flex-shrink: 0;
@@ -3015,14 +3066,125 @@ select.btn {
     font-size: 20px;
 }
 
-.lightbox-fav {
+.lightbox-btn {
     margin-left: auto;
+    font-size: 17px;
+}
+
+.lightbox-fav {
     font-size: 18px;
 }
 
 .lightbox-close:hover,
-.lightbox-fav:hover {
+.lightbox-fav:hover,
+.lightbox-btn:hover {
     background: rgba(255,255,255,0.1);
+}
+
+.lightbox-btn.active {
+    background: rgba(255,255,255,0.16);
+}
+
+/* What the camera wrote, alongside the photo */
+.exif-panel {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 300px;
+    padding: 14px 16px 20px;
+    overflow-y: auto;
+    background: rgba(24,25,28,.96);
+    border-left: 1px solid rgba(255,255,255,.08);
+    color: #f2f2f4;
+    font-size: 12.5px;
+    text-align: left;
+}
+
+.exif-panel[hidden] {
+    display: none;
+}
+
+/* The photo gives way to the panel instead of hiding under it */
+.lightbox-content.with-panel {
+    padding-right: 356px;
+}
+
+.lightbox-content.with-panel .lightbox-next {
+    right: 300px;
+}
+
+.exif-panel h3 {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: rgba(242,242,244,.55);
+    padding-bottom: 6px;
+    margin-bottom: 10px;
+    border-bottom: 1px solid rgba(255,255,255,.1);
+}
+
+.exif-rows {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 6px 12px;
+    align-items: baseline;
+}
+
+.exif-rows dt {
+    color: rgba(242,242,244,.55);
+    font-size: 11.5px;
+    white-space: nowrap;
+}
+
+.exif-rows dd {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    overflow-wrap: anywhere;
+}
+
+.exif-empty {
+    color: rgba(242,242,244,.55);
+    font-size: 12px;
+}
+
+.exif-panel details {
+    margin-top: 14px;
+    border-top: 1px solid rgba(255,255,255,.1);
+    padding-top: 10px;
+}
+
+.exif-panel summary {
+    cursor: pointer;
+    font-size: 11.5px;
+    color: rgba(242,242,244,.65);
+    list-style: none;
+}
+
+.exif-panel summary::-webkit-details-marker {
+    display: none;
+}
+
+.exif-panel summary::before {
+    content: "› ";
+    display: inline-block;
+    transition: transform 0.15s;
+}
+
+.exif-panel details[open] summary::before {
+    transform: rotate(90deg);
+}
+
+.exif-panel details .exif-rows {
+    margin-top: 10px;
+}
+
+.exif-panel details dt {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    white-space: normal;
 }
 
 .lightbox-fav.on {
@@ -4174,7 +4336,7 @@ select.btn {
 }
 
 .modal-list .dir-row::after {
-    content: "\203A";
+    content: "›";
     margin-left: auto;
     color: var(--faint);
 }
@@ -4405,6 +4567,7 @@ let batchIndex = [];         // imports offered in the picker, newest first
 let gridMode = 'folder';     // what the grid holds right now: folder | recursive | batch
 let treeShown = true;        // T: the folder tree on the left
 let jobOpen = false;         // the job pill's popover
+let exifOpen = false;        // I: the EXIF panel beside the photo
 let sizePath = '.';          // folder shown in the size dialog
 let sizeParent = null;
 
@@ -4427,6 +4590,7 @@ const batchSelect = document.getElementById('batch-select');
 const batchBarEl = document.getElementById('batch-bar');
 const recursiveChipEl = document.getElementById('recursive-chip');
 const statusLeftEl = document.getElementById('status-left');
+const exifPanelEl = document.getElementById('exif-panel');
 const jobPillEl = document.getElementById('job-pill');
 const headerProgressEl = document.getElementById('header-progress');
 const clearFilterBtn = document.getElementById('btn-clear-filter');
@@ -4482,6 +4646,14 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('btn-grid').addEventListener('click', () => setViewMode('grid'));
     document.getElementById('btn-list').addEventListener('click', () => setViewMode('list'));
     document.getElementById('lightbox-close').addEventListener('click', closeLightbox);
+    document.getElementById('lightbox-exif').addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleExif();
+    });
+    try {
+        exifOpen = localStorage.getItem('photoBrowserExif') === '1';
+    } catch (err) { /* keep it closed */ }
+    applyExifPanel();
     document.getElementById('lightbox-prev').addEventListener('click', prevImage);
     document.getElementById('lightbox-next').addEventListener('click', nextImage);
     lightboxFavEl.addEventListener('click', (e) => {
@@ -4622,6 +4794,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (e.key === 'ArrowLeft') prevImage();
             if (e.key === 'ArrowRight') nextImage();
             if (e.key === '*') toggleFavorite(currentMediaPath);
+            if (e.key === 'i' || e.key === 'I') toggleExif();
             return;
         }
 
@@ -5492,6 +5665,10 @@ function openLightbox(path) {
 }
 
 function closeLightbox() {
+    // The panel stays switched on for next time, but not with a stale photo
+    exifPanelEl.innerHTML = '';
+    delete exifPanelEl.dataset.path;
+
     lightboxEl.classList.remove('active');
     document.body.style.overflow = '';
     lightboxImgEl.src = '';
@@ -5529,6 +5706,8 @@ function showMedia(path) {
             : '';
     }
 
+    if (exifOpen) loadExif(path);
+
     // Size, date and folder along the bottom
     const folder = path.split('/').slice(0, -1).join('/');
     const parts = [];
@@ -5536,6 +5715,83 @@ function showMedia(path) {
     if (item && item.modified) parts.push(formatStamp(item.modified));
     if (folder) parts.push(folder);
     lightboxInfoEl.textContent = parts.join('   \u00b7   ');
+}
+
+// ---------------------------------------------------------------------------
+// I - what the camera wrote, beside the photo
+// ---------------------------------------------------------------------------
+
+function applyExifPanel() {
+    exifPanelEl.hidden = !exifOpen;
+    document.getElementById('lightbox-exif').classList.toggle('active', exifOpen);
+    document.querySelector('.lightbox-content').classList.toggle('with-panel', exifOpen);
+}
+
+function toggleExif() {
+    exifOpen = !exifOpen;
+    applyExifPanel();
+    try {
+        localStorage.setItem('photoBrowserExif', exifOpen ? '1' : '0');
+    } catch (err) { /* nothing to persist to */ }
+
+    if (exifOpen && currentMediaPath) loadExif(currentMediaPath);
+}
+
+async function loadExif(path) {
+    if (!exifOpen) return;
+
+    exifPanelEl.dataset.path = path;
+
+    // Only say "Reading" if the file is slow enough to notice
+    const slow = setTimeout(() => {
+        if (exifPanelEl.dataset.path === path) {
+            exifPanelEl.innerHTML = '<div class="exif-empty">Reading...</div>';
+        }
+    }, 150);
+
+    let data;
+    try {
+        const res = await fetch(`/api/exif?path=${encodeURIComponent(path)}`);
+        data = await res.json();
+    } catch (err) {
+        data = {error: 'Could not read this file'};
+    }
+    clearTimeout(slow);
+
+    // Arrow keys move faster than a RAW file reads - drop a stale answer
+    if (exifPanelEl.dataset.path !== path) return;
+
+    renderExif(data);
+}
+
+function renderExif(data) {
+    if (data.error) {
+        exifPanelEl.innerHTML = `<div class="exif-empty">${escapeHtml(data.error)}</div>`;
+        return;
+    }
+
+    const rows = (pairs) => '<dl class="exif-rows">' + pairs.map(([label, value]) =>
+        `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`).join('') + '</dl>';
+
+    const file = [
+        ['File', data.name || ''],
+        ['Size', formatSize(data.size || 0)],
+        ['Modified', formatStamp(data.modified)],
+    ].filter(([, value]) => value);
+
+    let html = '<h3>Photo</h3>';
+    html += (data.fields || []).length
+        ? rows(data.fields)
+        : '<div class="exif-empty">No EXIF in this file.</div>';
+
+    html += '<h3 style="margin-top:16px">File</h3>' + rows(file);
+
+    if ((data.tags || []).length) {
+        html += `<details><summary>All tags (${data.tags.length})</summary>`
+             + rows(data.tags) + '</details>';
+    }
+
+    exifPanelEl.innerHTML = html;
 }
 
 function prevImage() {

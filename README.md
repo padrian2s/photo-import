@@ -90,7 +90,7 @@ Tabs in the UI:
 
 | Tab | CLI equivalent |
 |-----|----------------|
-| **Browse** | browse the served folder, thumbnails, lightbox, keyboard navigation, favorites, **V** for every photo below the current folder, and **B** for the files of a single import |
+| **Browse** | browse the served folder, thumbnails, lightbox with EXIF (**I**), keyboard navigation, favorites, **V** for every photo below the current folder, and **B** for the files of a single import |
 | **Favorites** | every starred photo/video in one grid |
 | **Storage** | size in GB and photo/video counts per folder - per year inside the library - with drill-down |
 | **Import** | `scan` / `video-scan`, plus a shortcut for `copy` / `video-copy` of the latest batch |
@@ -109,6 +109,11 @@ Notes:
   show. **T** hides the folder tree when the grid wants the room.
 - **List** (**L**) is a real table - name, kind, size and modified date - and
   **Grid** (**G**) is the thumbnail wall.
+- In the lightbox, the **ⓘ** button (or **I**) opens what the camera wrote
+  next to the photo: body and lens, shutter, aperture, ISO, focal length,
+  when it was taken, GPS if there is any, plus every raw tag under **All
+  tags**. It stays open as you walk through the photos with the arrows, and
+  says so plainly when a file carries no EXIF.
 - One job runs at a time; starting a second one returns a "still running" error.
 - Source and target folders can be typed or picked with the **Browse** button, which walks the local filesystem, and **Current** fills in the folder currently open in the Browse tab.
 - The line under the target field spells out the exact destination (`.../organized_photos/YYYY/MM/DD/`) before anything is copied.
