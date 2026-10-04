@@ -51,7 +51,9 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
         """Handle GET requests."""
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
-        query = urllib.parse.parse_qs(parsed.query)
+        # keep_blank_values: "camera=" means the photos whose EXIF named no
+        # camera - an empty value is an answer, not a missing parameter.
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
 
         # API endpoints
         if path == '/api/tree':
@@ -662,7 +664,8 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
 
     def send_tree(self):
         """Send directory tree as JSON - only immediate children (lazy load)."""
-        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query,
+                                      keep_blank_values=True)
         relative_path = query.get('path', ['.'])[0]
 
         root = Path(self.root_directory).resolve()
@@ -701,9 +704,10 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
 
     def send_file_list(self, relative_path: str):
         """Send file list for a directory with pagination."""
-        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        page = int(query.get('page', ['1'])[0])
-        per_page = int(query.get('per_page', ['50'])[0])  # Default 50 items per page
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query,
+                                      keep_blank_values=True)
+        page = int(query.get('page', ['1'])[0] or 1)
+        per_page = int(query.get('per_page', ['50'])[0] or 50)  # Default 50 per page
         per_page = min(per_page, 200)  # Max 200 per page
         sort_by = query.get('sort', ['name'])[0]  # name, size, created, modified, accessed
         sort_order = query.get('order', ['asc'])[0]  # asc, desc
