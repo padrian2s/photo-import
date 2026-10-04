@@ -462,6 +462,60 @@ def _pillow_summary(filepath: Path) -> Optional[dict]:
     return {'fields': fields, 'tags': raw, 'source': 'pillow'}
 
 
+def read_camera_fields(filepath: str | Path) -> tuple:
+    """Just the camera, lens and date - the cheap read, for indexing a library.
+
+    read_exif_summary() builds the whole tag table, which is wasted work when
+    walking a hundred thousand files. Make and Model sit in the first IFD, so
+    exifread can stop as soon as it has the date and never touch the maker
+    note. Returns (camera, lens, taken_at); any of them may be None.
+    """
+    filepath = Path(filepath)
+
+    if HAS_EXIFREAD:
+        try:
+            with open(filepath, 'rb') as handle:
+                tags = exifread.process_file(handle, details=False,
+                                             stop_tag='DateTimeOriginal')
+            if tags:
+                def text(name):
+                    return str(tags[name]).strip().strip('\x00') if name in tags else ''
+
+                camera = _camera_name(text('Image Make'), text('Image Model'))
+                lens = text('EXIF LensModel') or None
+                taken = parse_exif_date(text('EXIF DateTimeOriginal')
+                                        or text('Image DateTime'))
+                if camera or taken:
+                    return camera, lens, taken
+        except Exception as e:  # noqa: BLE001 - an unreadable file is not fatal
+            logger.debug(f"camera read failed for {filepath}: {e}")
+
+    if HAS_PIL:
+        try:
+            with Image.open(filepath) as image:
+                exif = image.getexif()
+                named = {TAGS.get(tag_id, str(tag_id)): value
+                         for tag_id, value in exif.items()}
+                try:
+                    detail = exif.get_ifd(0x8769)
+                    named.update({TAGS.get(tag_id, str(tag_id)): value
+                                  for tag_id, value in detail.items()})
+                except Exception:  # noqa: BLE001
+                    pass
+
+            def plain(name):
+                value = named.get(name)
+                return str(value).strip().strip('\x00') if value is not None else ''
+
+            camera = _camera_name(plain('Make'), plain('Model'))
+            taken = parse_exif_date(plain('DateTimeOriginal') or plain('DateTime'))
+            return camera, (plain('LensModel') or None), taken
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"camera read via Pillow failed for {filepath}: {e}")
+
+    return None, None, None
+
+
 def read_exif_summary(filepath: str | Path) -> dict:
     """What the camera wrote into a photo, ready to put on screen.
 

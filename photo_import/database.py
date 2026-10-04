@@ -367,6 +367,101 @@ class Database:
             ).fetchone()
         return row is not None
 
+    # -------------------------------------------------------------------------
+    # Camera index - which camera took which photo, across the whole library
+    # -------------------------------------------------------------------------
+
+    def known_camera_photos(self, root: str) -> dict:
+        """What the index already holds under a path: path -> (mtime, size).
+
+        A re-scan reads only what changed, so this is the skip list.
+        """
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT path, file_mtime, file_size FROM camera_photos WHERE path LIKE ?",
+                (f"{root}%",)
+            ).fetchall()
+
+        return {row['path']: (row['file_mtime'], row['file_size']) for row in rows}
+
+    def save_camera_photos(self, rows: List[tuple]):
+        """Store a batch of (path, camera, lens, taken_at, size, mtime) rows."""
+        if not rows:
+            return
+
+        now = datetime.now()
+        with self._get_connection() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO camera_photos
+                    (path, camera, lens, taken_at, file_size, file_mtime, scanned_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [(*row, now) for row in rows]
+            )
+
+    def forget_camera_photos(self, paths: List[str]):
+        """Drop files that are no longer on disk."""
+        if not paths:
+            return
+
+        with self._get_connection() as conn:
+            conn.executemany("DELETE FROM camera_photos WHERE path = ?",
+                             [(path,) for path in paths])
+
+    def camera_totals(self, root: Optional[str] = None) -> List[dict]:
+        """One row per camera: how many photos, how big, first and last shot."""
+        where, params = "", []
+        if root:
+            where = "WHERE path LIKE ?"
+            params.append(f"{root}%")
+
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT COALESCE(camera, '') AS camera,
+                       COUNT(*) AS photos,
+                       SUM(file_size) AS bytes,
+                       MIN(taken_at) AS first_taken,
+                       MAX(taken_at) AS last_taken
+                FROM camera_photos
+                {where}
+                GROUP BY COALESCE(camera, '')
+                ORDER BY photos DESC
+                """,
+                params
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def camera_photo_paths(self, camera: Optional[str], root: Optional[str] = None) -> List[dict]:
+        """Every photo one camera took, oldest first.
+
+        An empty camera name means the files whose EXIF said nothing.
+        """
+        clauses, params = [], []
+        if camera:
+            clauses.append("camera = ?")
+            params.append(camera)
+        else:
+            clauses.append("(camera IS NULL OR camera = '')")
+        if root:
+            clauses.append("path LIKE ?")
+            params.append(f"{root}%")
+
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT path, camera, lens, taken_at, file_size
+                FROM camera_photos
+                WHERE {' AND '.join(clauses)}
+                ORDER BY taken_at IS NULL, taken_at, path
+                """,
+                params
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
     def get_batch_stats(self, batch_id: int) -> dict:
         """Get statistics for a batch."""
         with self._get_connection() as conn:

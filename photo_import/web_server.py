@@ -86,6 +86,10 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
             self.send_preview(query)
         elif path == '/api/exif':
             self.send_exif(query)
+        elif path == '/api/cameras':
+            self.send_cameras(query)
+        elif path == '/api/camera-photos':
+            self.send_camera_photos(query)
         elif path == '/api/list':
             dir_path = query.get('path', ['.'])[0]
             self.send_file_list(dir_path)
@@ -132,6 +136,7 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
             '/api/copy': self.start_copy_job,
             '/api/retry': self.start_retry_job,
             '/api/expand': self.start_expand_job,
+            '/api/cameras/scan': self.start_camera_job,
             '/api/job/cancel': self.cancel_job,
             '/api/conflicts/resolve': self.start_resolve_job,
         }
@@ -567,6 +572,16 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
         job = self.job_manager.start_retry(payload.get('media', PHOTO), int(batch_id))
         self.send_json(job.to_dict(), 202)
 
+    def start_camera_job(self, payload: dict):
+        """Index which camera took every photo under a folder."""
+        workers = payload.get('workers')
+        job = self.job_manager.start_camera_scan(
+            path=payload.get('path') or self.root_directory,
+            rescan=bool(payload.get('rescan')),
+            workers=int(workers) if workers else None,
+        )
+        self.send_json(job.to_dict())
+
     def start_expand_job(self, payload: dict):
         """POST /api/expand - equivalent of `photo-import expand`."""
         target = str(payload.get('target', '')).strip()
@@ -979,6 +994,102 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
             "source": summary["source"],
         })
 
+    def send_cameras(self, query: dict):
+        """One row per camera: how many photos, how big, first and last shot."""
+        if self.job_manager is None:
+            self.send_json({"error": "Import operations are disabled"}, 503)
+            return
+
+        root = query.get('root', [''])[0]
+        prefix = str(Path(root).expanduser().resolve()) + os.sep if root else None
+        rows = self.job_manager.db.camera_totals(prefix)
+
+        self.send_json({
+            "root": root,
+            "cameras": rows,
+            "totals": {
+                "photos": sum(row["photos"] for row in rows),
+                "bytes": sum(row["bytes"] or 0 for row in rows),
+                "cameras": len([row for row in rows if row["camera"]]),
+                "unknown": sum(row["photos"] for row in rows if not row["camera"]),
+            },
+        })
+
+    def send_camera_photos(self, query: dict):
+        """The photos one camera took, as a flat grid."""
+        if self.job_manager is None:
+            self.send_json({"error": "Import operations are disabled"}, 503)
+            return
+
+        if 'camera' not in query:
+            self.send_json({"error": "camera is required"}, 400)
+            return
+
+        camera = query.get('camera', [''])[0]
+        refresh = query.get('refresh', ['0'])[0] == '1'
+        sort_by = query.get('sort', ['taken'])[0]
+        sort_order = query.get('order', ['asc'])[0]
+
+        root_arg = query.get('root', [''])[0]
+        prefix = str(Path(root_arg).expanduser().resolve()) + os.sep if root_arg else None
+
+        root = Path(self.root_directory).resolve()
+        cache_key = f"camera:{camera}:{prefix or ''}"
+        collected = None if refresh else BATCH_CACHE.get(cache_key)
+        if collected is None:
+            records = self.job_manager.db.camera_photo_paths(camera or None, prefix)
+            collected = collect_camera_media(records, root)
+            while len(BATCH_CACHE) >= 4:
+                BATCH_CACHE.pop(next(iter(BATCH_CACHE)))
+            BATCH_CACHE[cache_key] = collected
+
+        entries = collected["entries"]
+
+        def sort_key(item):
+            if sort_by == 'taken':
+                # Undated photos go last, whichever way the list is turned
+                return (item.get('taken') is None, item.get('taken') or '')
+            if sort_by == 'size':
+                return item['size']
+            if sort_by in ('created', 'modified', 'accessed'):
+                return item[sort_by]
+            return item['path'].lower()
+
+        items = sorted(entries, key=sort_key, reverse=sort_order == 'desc')
+
+        page = max(1, int(query.get('page', ['1'])[0] or 1))
+        per_page = min(int(query.get('per_page', ['50'])[0] or 50), 200)
+        total = len(items)
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        page = min(page, total_pages)
+
+        window = items[(page - 1) * per_page: page * per_page]
+        favorite_paths = self.favorites.all_paths() if self.favorites else set()
+        for item in window:
+            item["favorite"] = item["path"] in favorite_paths
+
+        dated = [item['taken'] for item in entries if item.get('taken')]
+        self.send_json({
+            "camera": {
+                "name": camera,
+                "shown": total,
+                "outside": collected["outside"],
+                "missing": collected["missing"],
+                "first": min(dated) if dated else None,
+                "last": max(dated) if dated else None,
+            },
+            "items": window,
+            "sort": sort_by,
+            "order": sort_order,
+            "pagination": {
+                "page": page,
+                "per_page": per_page,
+                "total_files": total,
+                "total_dirs": 0,
+                "total_pages": total_pages,
+            },
+        })
+
     def send_image_list(self, relative_path: str):
         """Send list of images in a directory."""
         images = list_images_in_directory(self.root_directory, relative_path)
@@ -1226,6 +1337,51 @@ def collect_media_recursive(directory: Path, root: Path) -> list:
     return entries
 
 
+def listing_entry(target: str, root: Path, fallback_size: int = 0):
+    """One grid entry for a file named by absolute path.
+
+    Returns (entry, state) where state is 'ok', 'missing' when the file is
+    gone, or 'outside' when it does not live under the served folder and so
+    cannot be shown at all.
+    """
+    path = Path(target)
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        try:
+            relative = path.resolve().relative_to(root)
+        except (ValueError, OSError):
+            return None, 'outside'
+
+    extension = path.suffix.lower()
+    entry = {
+        "name": path.name,
+        "path": str(relative),
+        "folder": str(relative.parent),
+        "is_dir": False,
+        "extension": extension,
+        "size": fallback_size or 0,
+        "is_image": extension in IMAGE_EXTENSIONS,
+        "is_video": extension in VIDEO_EXTENSIONS,
+        "is_raw": extension in RAW_EXTENSIONS,
+    }
+
+    try:
+        stat = (root / relative).stat()
+    except OSError:
+        entry["missing"] = True
+        entry["modified"] = 0
+        entry["accessed"] = 0
+        entry["created"] = 0
+        return entry, 'missing'
+
+    entry["size"] = stat.st_size
+    entry["modified"] = stat.st_mtime
+    entry["accessed"] = stat.st_atime
+    entry["created"] = getattr(stat, 'st_birthtime', stat.st_ctime)
+    return entry, 'ok'
+
+
 def collect_batch_media(records: list, root: Path) -> dict:
     """Turn a batch's copied files into listing entries, as the grid wants them.
 
@@ -1243,43 +1399,37 @@ def collect_batch_media(records: list, root: Path) -> dict:
         if not target:
             continue
 
-        path = Path(target)
-        try:
-            relative = path.relative_to(root)
-        except ValueError:
-            try:
-                relative = path.resolve().relative_to(root)
-            except (ValueError, OSError):
-                outside += 1
-                continue
-
-        extension = path.suffix.lower()
-        entry = {
-            "name": path.name,
-            "path": str(relative),
-            "folder": str(relative.parent),
-            "is_dir": False,
-            "extension": extension,
-            "size": record.get("file_size") or 0,
-            "is_image": extension in IMAGE_EXTENSIONS,
-            "is_video": extension in VIDEO_EXTENSIONS,
-            "is_raw": extension in RAW_EXTENSIONS,
-        }
-
-        try:
-            stat = (root / relative).stat()
-        except OSError:
+        entry, state = listing_entry(target, root, record.get("file_size") or 0)
+        if state == 'outside':
+            outside += 1
+            continue
+        if state == 'missing':
             missing += 1
-            entry["missing"] = True
-            entry["modified"] = 0
-            entry["accessed"] = 0
-            entry["created"] = 0
-        else:
-            entry["size"] = stat.st_size
-            entry["modified"] = stat.st_mtime
-            entry["accessed"] = stat.st_atime
-            entry["created"] = getattr(stat, 'st_birthtime', stat.st_ctime)
+        entries.append(entry)
 
+    return {"entries": entries, "outside": outside, "missing": missing}
+
+
+def collect_camera_media(records: list, root: Path) -> dict:
+    """Every photo one camera took, as listing entries.
+
+    The index holds the whole library, which may be wider than the folder
+    being served, so anything outside it is counted and left out.
+    """
+    entries = []
+    outside = 0
+    missing = 0
+
+    for record in records:
+        entry, state = listing_entry(record["path"], root, record.get("file_size") or 0)
+        if state == 'outside':
+            outside += 1
+            continue
+        if state == 'missing':
+            missing += 1
+
+        # The tile says when the shutter went, which is what sorts them
+        entry["taken"] = record.get("taken_at")
         entries.append(entry)
 
     return {"entries": entries, "outside": outside, "missing": missing}
@@ -1599,6 +1749,7 @@ def get_index_html() -> str:
                     <button class="tab" data-view="storage">Storage</button>
                     <button class="tab import-only" data-view="import">Import</button>
                     <button class="tab import-only" data-view="batches">Batches</button>
+                    <button class="tab import-only" data-view="cameras">Cameras</button>
                     <button class="tab import-only" data-view="tools">Tools</button>
                 </nav>
 
@@ -1646,6 +1797,7 @@ def get_index_html() -> str:
                     <button class="btn tiny" id="btn-tree" title="Toggle folder tree (T)" data-shortcut="T">&#9776;</button>
                     <div class="breadcrumb" id="breadcrumb"></div>
                     <div class="chip" id="batch-bar" hidden></div>
+                    <div class="chip" id="camera-chip" hidden></div>
                     <div class="chip" id="recursive-chip" hidden>
                         <b>All photos below this folder</b>
                         <button class="chip-close" data-exit-recursive="1" title="Back to the folder listing (V)">&times;</button>
@@ -1741,6 +1893,45 @@ def get_index_html() -> str:
                 </div>
                 <div id="conflict-list" class="conflict-list"></div>
                 <div class="pagination" id="conflict-pagination"></div>
+            </div>
+        </div>
+
+        <!-- Cameras view: which camera took what, across the library -->
+        <div class="view panel-view" id="view-cameras">
+            <div class="card">
+                <div class="card-head">
+                    <h2>Cameras</h2>
+                    <div class="seg" id="cameras-measure">
+                        <button class="seg-btn active" data-measure="photos">By photos</button>
+                        <button class="seg-btn" data-measure="bytes">By size</button>
+                    </div>
+                    <button class="btn" id="btn-cameras-refresh">Refresh</button>
+                </div>
+                <p class="card-hint">
+                    Reads the camera out of every photo under a folder and keeps it in the
+                    database. Pick a camera to see its photos, oldest first.
+                </p>
+
+                <div class="field">
+                    <label for="cameras-path">Folder to index</label>
+                    <div class="field-row">
+                        <input type="text" id="cameras-path" placeholder="/Volumes/poze">
+                        <button class="btn" data-pick="cameras-path">Browse</button>
+                        <button class="btn" data-fill-current="cameras-path" title="Use the folder open in Browse">Current</button>
+                    </div>
+                </div>
+
+                <div class="options">
+                    <label class="check"><input type="checkbox" id="cameras-rescan"> Read every file again, even unchanged ones</label>
+                </div>
+
+                <div class="actions">
+                    <button class="btn primary" id="btn-cameras-scan">Index cameras</button>
+                    <span class="form-error" id="cameras-error"></span>
+                </div>
+
+                <div class="storage-summary" id="cameras-summary" style="margin-top:16px"></div>
+                <div id="cameras-table"></div>
             </div>
         </div>
 
@@ -4657,6 +4848,9 @@ let gridMode = 'folder';     // what the grid holds right now: folder | recursiv
 let treeShown = true;        // T: the folder tree on the left
 let jobOpen = false;         // the job pill's popover
 let exifOpen = false;        // I: the EXIF panel beside the photo
+let cameraView = null;       // {name, info} when the grid shows one camera
+let cameraMeasure = 'photos';  // what the bars in the Cameras table measure
+let sortBeforeCamera = null;   // the sort to put back on the way out
 let sizePath = '.';          // folder shown in the size dialog
 let sizeParent = null;
 
@@ -4679,6 +4873,7 @@ const batchSelect = document.getElementById('batch-select');
 const batchBarEl = document.getElementById('batch-bar');
 const recursiveChipEl = document.getElementById('recursive-chip');
 const statusLeftEl = document.getElementById('status-left');
+const cameraChipEl = document.getElementById('camera-chip');
 const exifPanelEl = document.getElementById('exif-panel');
 const jobPillEl = document.getElementById('job-pill');
 const headerProgressEl = document.getElementById('header-progress');
@@ -4720,6 +4915,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     recursiveChipEl.addEventListener('click', (e) => {
         if (e.target.closest('[data-exit-recursive]')) toggleRecursive(false);
+    });
+    cameraChipEl.addEventListener('click', (e) => {
+        if (e.target.closest('[data-exit-camera]')) exitCameraView();
     });
 
     document.getElementById('btn-recursive').addEventListener('click', () => toggleRecursive());
@@ -5165,7 +5363,14 @@ async function loadDirectory(path, page = 1, restore = null) {
     try {
         const common = `page=${page}&per_page=${perPage}&sort=${sortBy}&order=${sortOrder}`;
         let url;
-        if (batchView) {
+        if (cameraView) {
+            // One camera's photos, oldest first - the folder waits for the way back
+            url = `/api/camera-photos?camera=${encodeURIComponent(cameraView.name)}&${common}`;
+            if (cameraView.refresh) {
+                url += '&refresh=1';
+                cameraView.refresh = false;
+            }
+        } else if (batchView) {
             // One import, flattened - the folder we came from is kept for the way back
             url = `/api/batch-media?media=${batchView.media}&id=${batchView.id}&${common}`;
             if (batchNeedsRefresh) {
@@ -5192,9 +5397,15 @@ async function loadDirectory(path, page = 1, restore = null) {
 
         // Store all items for filtering
         allItems = data.items;
-        gridMode = batchView ? 'batch' : (recursiveMode ? 'recursive' : 'folder');
+        gridMode = cameraView ? 'camera'
+            : batchView ? 'batch'
+            : (recursiveMode ? 'recursive' : 'folder');
 
-        if (batchView) {
+        if (cameraView) {
+            cameraView.info = data.camera;
+            renderCameraChip(data.camera);
+            breadcrumbEl.innerHTML = `<a href="#" data-path=".">${escapeHtml(libraryName())}</a>`;
+        } else if (batchView) {
             batchView.info = data.batch;
             renderBatchBar(data.batch);
             renderBatchBreadcrumb(data.batch);
@@ -5232,7 +5443,8 @@ function toggleRecursive(force) {
     const wanted = force === undefined ? !recursiveMode : force;
     if (wanted === recursiveMode) return;
 
-    exitBatchView(false);   // the two flat views are alternatives, not layers
+    exitBatchView(false);    // the flat views are alternatives, not layers
+    exitCameraView(false);
 
     if (wanted) rememberDirState();   // keep the folder's own spot for the way back
     recursiveMode = wanted;
@@ -5263,7 +5475,8 @@ function rememberDirState() {
 
 // Navigate to a folder, landing where we left off if we have been there
 function navigateTo(path) {
-    exitBatchView(false);   // a folder was asked for, so stop showing one import
+    exitBatchView(false);    // a folder was asked for, so stop showing one import
+    exitCameraView(false);   // ...or one camera
     if (recursiveMode) {
         recursiveMode = false;
         document.getElementById('btn-recursive').classList.remove('active');
@@ -5415,6 +5628,7 @@ function renderBatchOptions() {
 }
 
 function enterBatchView(mediaType, batchId) {
+    exitCameraView(false);
     if (recursiveMode) {
         recursiveMode = false;
         document.getElementById('btn-recursive').classList.remove('active');
@@ -5495,6 +5709,91 @@ function libraryName() {
     const parts = (serverConfig.root || '').split('/').filter(Boolean);
     const name = parts.length ? parts[parts.length - 1] : '';
     return name && name !== '.' ? name : 'Home';
+}
+
+// ---------------------------------------------------------------------------
+// One camera's photos in the Browse grid
+// ---------------------------------------------------------------------------
+
+function renderCameraChip(info) {
+    if (!info) {
+        cameraChipEl.hidden = true;
+        cameraChipEl.innerHTML = '';
+        return;
+    }
+
+    const span = info.first && info.last
+        ? `${formatBatchDate(info.first)} \u2192 ${formatBatchDate(info.last)}`
+        : 'no dates in these files';
+
+    let html = `<b>${escapeHtml(info.name || 'Unknown camera')}</b>`;
+    html += `<span class="mono">${(info.shown || 0).toLocaleString()} photos</span>`;
+    html += `<span class="mono">${escapeHtml(span)}</span>`;
+
+    const gaps = [];
+    if (info.missing) gaps.push(`${info.missing.toLocaleString()} missing`);
+    if (info.outside) gaps.push(`${info.outside.toLocaleString()} elsewhere`);
+    if (gaps.length) html += `<span class="mono warn">${escapeHtml(gaps.join(' - '))}</span>`;
+
+    html += `<button class="chip-close" data-exit-camera="1" title="Back to the folders">\u00d7</button>`;
+    cameraChipEl.innerHTML = html;
+    cameraChipEl.hidden = false;
+}
+
+function enterCameraView(name) {
+    exitBatchView(false);
+    if (recursiveMode) {
+        recursiveMode = false;
+        document.getElementById('btn-recursive').classList.remove('active');
+        contentEl.classList.remove('recursive');
+        recursiveChipEl.hidden = true;
+    } else {
+        rememberDirState();   // keep the folder's own spot for the way back
+    }
+
+    cameraView = {name: name, refresh: true};
+
+    // These photos are worth seeing in the order they were taken
+    sortBeforeCamera = sortBy;
+    addTakenSortOption();
+    sortBy = 'taken';
+    sortSelect.value = 'taken';
+
+    clearFilter();
+    setView('browse');
+    loadDirectory(currentPath, 1);
+}
+
+function exitCameraView(reload = true) {
+    if (!cameraView) return;
+
+    cameraView = null;
+    renderCameraChip(null);
+    removeTakenSortOption();
+    if (sortBeforeCamera) {
+        sortBy = sortBeforeCamera;
+        sortSelect.value = sortBeforeCamera;
+        sortBeforeCamera = null;
+    }
+
+    if (reload) {
+        const saved = dirState.get(currentPath);
+        loadDirectory(currentPath, saved ? saved.page : 1, saved || null);
+    }
+}
+
+// "Taken" only means something where the dates come from the index
+function addTakenSortOption() {
+    if (sortSelect.querySelector('option[value="taken"]')) return;
+    const option = document.createElement('option');
+    option.value = 'taken';
+    option.textContent = 'Taken';
+    sortSelect.insertBefore(option, sortSelect.firstChild);
+}
+
+function removeTakenSortOption() {
+    const option = sortSelect.querySelector('option[value="taken"]');
+    if (option) option.remove();
 }
 
 // Render breadcrumb navigation
@@ -5655,10 +5954,13 @@ function renderFileItem(item) {
     // so on the tile instead of leaving a broken image behind
     const empty = !item.missing && item.size === 0 ? ' empty-file' : '';
 
-    // In the flat view a tile also says which folder it came from
-    const sub = item.folder && item.folder !== currentPath
-        ? `<div class="file-sub">${escapeHtml(item.folder)}</div>`
-        : '';
+    // In the flat view a tile also says which folder it came from - except
+    // under one camera, where when it was taken is the thing that orders them
+    const sub = cameraView && item.taken
+        ? `<div class="file-sub">${escapeHtml(formatBatchDate(item.taken))}</div>`
+        : (item.folder && item.folder !== currentPath
+            ? `<div class="file-sub">${escapeHtml(item.folder)}</div>`
+            : '');
 
     if (item.is_image) {
         const thumb = (item.missing || empty)
@@ -6301,6 +6603,17 @@ async function initManage() {
     document.getElementById('btn-all-batches').addEventListener('click', () => setView('batches'));
     document.getElementById('btn-expand').addEventListener('click', startExpand);
     document.getElementById('btn-refresh-batches').addEventListener('click', loadBatches);
+    document.getElementById('btn-cameras-refresh').addEventListener('click', loadCameras);
+    document.getElementById('btn-cameras-scan').addEventListener('click', startCameraScan);
+    document.getElementById('cameras-path').value = serverConfig.root || '';
+    bindSegmented('cameras-measure', (measure) => {
+        cameraMeasure = measure;
+        loadCameras();
+    });
+    document.getElementById('cameras-table').addEventListener('click', (e) => {
+        const link = e.target.closest('[data-camera]');
+        if (link) enterCameraView(link.dataset.camera);
+    });
     document.getElementById('btn-refresh-jobs').addEventListener('click', () => renderJobHistory(latestJobs));
     document.getElementById('job-cancel').addEventListener('click', cancelWatchedJob);
     document.getElementById('job-dismiss').addEventListener('click', () => {
@@ -6387,7 +6700,7 @@ function bindSegmented(id, onChange) {
         const btn = e.target.closest('.seg-btn');
         if (!btn) return;
         container.querySelectorAll('.seg-btn').forEach(b => b.classList.toggle('active', b === btn));
-        onChange(btn.dataset.media);
+        onChange(btn.dataset.media || btn.dataset.measure);
     });
 }
 
@@ -6400,6 +6713,7 @@ function setView(view) {
         el.classList.toggle('active', el.id === `view-${view}`);
     });
 
+    if (view === 'cameras') loadCameras();
     if (view === 'import') loadLatestBatch();
     if (view === 'batches') loadBatches();
     if (view === 'tools') renderJobHistory(latestJobs);
@@ -6571,6 +6885,7 @@ async function pollJobs() {
 
 function refreshBrowseAfterJob() {
     loadBatchIndex();   // a copy may have created or grown an import
+    if (currentView === 'cameras') loadCameras();
 
     // Newly copied files may have appeared in the served tree
     if (currentView === 'browse') {
@@ -6656,6 +6971,15 @@ function describeJobResult(job) {
     if (job.kind === 'expand') {
         return `${result.dirs_processed || 0} folders expanded, ${result.files_moved || 0} files, `
             + `${result.dirs_skipped || 0} skipped, ${result.error_count || 0} errors.`;
+    }
+    if (job.kind === 'cameras') {
+        const forgotten = result.forgotten
+            ? `, ${result.forgotten.toLocaleString()} gone from disk`
+            : '';
+        return `${(result.photos || 0).toLocaleString()} photos under this folder: `
+            + `${(result.read || 0).toLocaleString()} read, `
+            + `${(result.skipped || 0).toLocaleString()} unchanged${forgotten}. `
+            + `${result.cameras || 0} cameras.`;
     }
     return 'Done.';
 }
@@ -6971,6 +7295,82 @@ favoritesGridEl.addEventListener('click', (e) => {
     media = favoriteItems.filter(f => !f.missing && (f.is_image || f.is_video));
     openLightbox(item.dataset.path);
 });
+
+// ---------------------------------------------------------------------------
+// Cameras - which camera took what, across the whole library
+// ---------------------------------------------------------------------------
+
+async function loadCameras() {
+    const table = document.getElementById('cameras-table');
+    table.innerHTML = '<div class="loading-indicator">Loading...</div>';
+
+    try {
+        const data = await api('GET', '/api/cameras');
+        renderCameras(data);
+    } catch (err) {
+        table.innerHTML = `<div class="form-error">${escapeHtml(err.message)}</div>`;
+    }
+}
+
+function renderCameras(data) {
+    const totals = data.totals || {};
+    const rows = data.cameras || [];
+
+    document.getElementById('cameras-summary').innerHTML = `
+        <span>Photos indexed<b>${(totals.photos || 0).toLocaleString()}</b></span>
+        <span>Cameras<b>${(totals.cameras || 0).toLocaleString()}</b></span>
+        <span>Without EXIF<b>${(totals.unknown || 0).toLocaleString()}</b></span>
+        <span>Total size<b>${formatGB(totals.bytes || 0)}</b></span>
+    `;
+
+    const table = document.getElementById('cameras-table');
+    if (rows.length === 0) {
+        table.innerHTML = '<div class="card-hint">Nothing indexed yet - pick a folder and press Index cameras.</div>';
+        return;
+    }
+
+    // The bar is the chart: longest bar is whichever camera leads the measure
+    const value = (row) => cameraMeasure === 'bytes' ? (row.bytes || 0) : row.photos;
+    const biggest = Math.max(1, ...rows.map(value));
+    const ordered = [...rows].sort((a, b) => value(b) - value(a));
+
+    const body = ordered.map(row => {
+        const name = row.camera || 'Without EXIF';
+        const span = row.first_taken && row.last_taken
+            ? `${formatBatchDate(row.first_taken)}</td><td>${formatBatchDate(row.last_taken)}`
+            : '-</td><td>-';
+        return `
+        <tr>
+            <td><span class="folder-link" data-camera="${escapeHtml(row.camera || '')}">${escapeHtml(name)}</span></td>
+            <td class="num">${row.photos.toLocaleString()}</td>
+            <td class="num">${formatGB(row.bytes || 0)}</td>
+            <td>${span}</td>
+            <td><div class="storage-bar" style="width: ${Math.round(100 * value(row) / biggest)}%"></div></td>
+        </tr>`;
+    }).join('');
+
+    table.innerHTML = `
+        <table class="storage-table">
+            <thead>
+                <tr>
+                    <th>Camera</th><th>Photos</th><th>Size</th>
+                    <th>First photo</th><th>Last photo</th><th style="width:25%"></th>
+                </tr>
+            </thead>
+            <tbody>${body}</tbody>
+        </table>
+    `;
+}
+
+async function startCameraScan() {
+    const path = document.getElementById('cameras-path').value.trim() || serverConfig.root;
+
+    showFormMessage('cameras-error', '');
+    await runJob('cameras-error', () => api('POST', '/api/cameras/scan', {
+        path: path,
+        rescan: document.getElementById('cameras-rescan').checked,
+    }));
+}
 
 // ---------------------------------------------------------------------------
 // Storage - size and counts per folder (per year inside the library)

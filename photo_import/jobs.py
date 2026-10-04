@@ -9,6 +9,7 @@ concurrently.
 """
 
 import logging
+import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -24,6 +25,14 @@ MAX_HISTORY = 50
 
 PHOTO = "photo"
 VIDEO = "video"
+
+# What counts as a photo worth asking about a camera
+CAMERA_EXTENSIONS = {
+    '.jpg', '.jpeg', '.jpe', '.jif', '.jfif', '.tif', '.tiff', '.png',
+    '.heic', '.heif', '.webp', '.bmp',
+    '.raw', '.cr2', '.cr3', '.nef', '.arw', '.dng', '.orf', '.rw2', '.pef',
+    '.srw', '.raf',
+}
 
 
 class JobCancelled(Exception):
@@ -443,6 +452,102 @@ class JobManager:
                 "files_moved": result.files_moved,
                 "errors": [{"path": path, "error": message} for path, message in result.errors[:20]],
                 "error_count": len(result.errors),
+            }
+
+        return self._spawn(job, work)
+
+
+    def start_camera_scan(
+        self,
+        path: str,
+        rescan: bool = False,
+        workers: Optional[int] = None,
+    ) -> Job:
+        """Index which camera took every photo under a path."""
+        root = Path(path).expanduser().resolve()
+        if not root.is_dir():
+            raise ValueError(f"Folder not found: {root}")
+
+        job = self._create(
+            "cameras", "files",
+            f"Camera index: {root.name or root}{' (full rescan)' if rescan else ''}",
+            {"path": str(root), "rescan": rescan, "workers": workers},
+        )
+
+        def work(job: Job) -> dict:
+            from concurrent.futures import ThreadPoolExecutor
+            from .exif_reader import read_camera_fields
+            from .scanner import DEFAULT_WORKERS
+
+            prefix = str(root) + os.sep
+            known = {} if rescan else self.db.known_camera_photos(prefix)
+
+            # Walk first, so the progress bar has a total to count against
+            files = []
+            for current, dirs, names in os.walk(root):
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                job.check_cancelled()
+                for name in names:
+                    if name.startswith('.'):
+                        continue
+                    if Path(name).suffix.lower() in CAMERA_EXTENSIONS:
+                        files.append(os.path.join(current, name))
+
+            total = len(files)
+            job.update(0, total, "Checking what changed...")
+
+            # What has not changed since the last pass needs no reading
+            seen = set()
+            to_read = []
+            skipped = 0
+            for file_path in files:
+                seen.add(file_path)
+                try:
+                    stat = os.stat(file_path)
+                except OSError:
+                    continue
+                if known.get(file_path) == (stat.st_mtime, stat.st_size):
+                    skipped += 1
+                else:
+                    to_read.append((file_path, stat.st_mtime, stat.st_size))
+
+            done = skipped
+            job.update(done, total, "")
+
+            CHUNK = 200
+            workers_used = workers or min(16, DEFAULT_WORKERS)
+            with ThreadPoolExecutor(max_workers=workers_used) as pool:
+                for index in range(0, len(to_read), CHUNK):
+                    job.check_cancelled()
+                    chunk = to_read[index:index + CHUNK]
+
+                    # Reading EXIF is I/O bound, so the chunk goes out in parallel
+                    results = list(pool.map(read_camera_fields,
+                                            [path for path, _, _ in chunk]))
+
+                    rows = []
+                    for (file_path, mtime, size), (camera, lens, taken) in zip(chunk, results):
+                        rows.append((
+                            file_path, camera, lens,
+                            taken.isoformat(sep=' ', timespec='seconds') if taken else None,
+                            size, mtime,
+                        ))
+
+                    self.db.save_camera_photos(rows)
+                    done += len(chunk)
+                    job.update(done, total, chunk[-1][0])
+
+            # Files the index remembers but the disk no longer has
+            gone = [path for path in known if path not in seen]
+            self.db.forget_camera_photos(gone)
+
+            cameras = self.db.camera_totals(prefix)
+            return {
+                "photos": total,
+                "read": len(to_read),
+                "skipped": skipped,
+                "forgotten": len(gone),
+                "cameras": len([row for row in cameras if row["camera"]]),
             }
 
         return self._spawn(job, work)

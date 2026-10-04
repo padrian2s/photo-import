@@ -106,7 +106,22 @@ CREATE TABLE IF NOT EXISTS photo_files (
     FOREIGN KEY (batch_id) REFERENCES batches(id)
 );
 
+-- Which camera took which photo, for the whole library rather than one batch.
+-- Keyed on the absolute path; mtime and size let a re-scan skip what has not
+-- changed.
+CREATE TABLE IF NOT EXISTS camera_photos (
+    path TEXT PRIMARY KEY,
+    camera TEXT,
+    lens TEXT,
+    taken_at TIMESTAMP,
+    file_size INTEGER NOT NULL,
+    file_mtime REAL NOT NULL,
+    scanned_at TIMESTAMP NOT NULL
+);
+
 -- Indexes for performance
+CREATE INDEX IF NOT EXISTS idx_camera_photos_camera ON camera_photos(camera);
+CREATE INDEX IF NOT EXISTS idx_camera_photos_taken ON camera_photos(taken_at);
 CREATE INDEX IF NOT EXISTS idx_photo_files_batch_id ON photo_files(batch_id);
 CREATE INDEX IF NOT EXISTS idx_photo_files_status ON photo_files(status);
 CREATE INDEX IF NOT EXISTS idx_photo_files_source_path ON photo_files(source_path);
