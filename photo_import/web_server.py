@@ -1528,6 +1528,7 @@ def run_server(
     print(f"{'='*50}")
     print(f"Serving: {PhotoBrowserHandler.root_directory}")
     print(f"URL: {url}")
+    print(f"UI build: {ui_build_id()} (version {__version__})")
     print(f"Favorites: {Path(favorites_db_path).resolve()}")
     if enable_import:
         print(f"Photo DB: {Path(db_path).resolve()}")
@@ -2876,6 +2877,23 @@ select.btn {
     opacity: 0.55;
     outline: 1px dashed var(--danger);
     outline-offset: -1px;
+}
+
+/* Zero bytes on disk: there is a name, but no photo behind it */
+.file-item.empty-file {
+    outline: 1px dashed var(--warn);
+    outline-offset: -1px;
+}
+
+.file-item.empty-file .file-icon {
+    color: var(--warn);
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.file-item.empty-file .file-name {
+    color: var(--warn);
 }
 
 .empty,
@@ -5633,17 +5651,21 @@ function renderFileItem(item) {
                   >${item.favorite ? '\\u2605' : '\\u2606'}</button>`;
     const missing = item.missing ? ' missing' : '';
 
+    // A file of zero bytes has no thumbnail to draw and nothing to open - say
+    // so on the tile instead of leaving a broken image behind
+    const empty = !item.missing && item.size === 0 ? ' empty-file' : '';
+
     // In the flat view a tile also says which folder it came from
     const sub = item.folder && item.folder !== currentPath
         ? `<div class="file-sub">${escapeHtml(item.folder)}</div>`
         : '';
 
     if (item.is_image) {
-        const thumb = item.missing
-            ? '<div class="file-icon">&#10071;</div>'
+        const thumb = (item.missing || empty)
+            ? `<div class="file-icon">${empty ? '0&#8202;B' : '&#10071;'}</div>`
             : `<img class="file-thumb" src="/api/thumbnail/${encodeURIComponent(item.path)}" alt="${name}" loading="lazy">`;
         return `
-            <div class="file-item image${missing}" data-path="${path}">
+            <div class="file-item image${missing}${empty}" data-path="${path}">
                 ${thumb}${star}
                 <div class="file-name">${name}</div>${sub}${cols}
             </div>
@@ -5652,7 +5674,7 @@ function renderFileItem(item) {
 
     if (item.is_video) {
         return `
-            <div class="file-item video${missing}" data-path="${path}">
+            <div class="file-item video${missing}${empty}" data-path="${path}">
                 <div class="video-icon">&#9658;</div>${star}
                 <div class="file-name">${name}</div>${sub}${cols}
             </div>
@@ -5662,7 +5684,7 @@ function renderFileItem(item) {
     if (item.is_raw) {
         const kind = (item.extension || '').replace('.', '').toUpperCase();
         return `
-            <div class="file-item raw${missing}" data-path="${path}">
+            <div class="file-item raw${missing}${empty}" data-path="${path}">
                 <div class="raw-icon">${escapeHtml(kind || 'RAW')}</div>${star}
                 <div class="file-name">${name}</div>${sub}${cols}
             </div>
@@ -5826,9 +5848,20 @@ async function loadExif(path) {
     let data;
     try {
         const res = await fetch(`/api/exif?path=${encodeURIComponent(path)}`);
-        data = await res.json();
+        if (res.status === 404) {
+            // Either the file moved, or this server predates the endpoint
+            const body = await res.text();
+            data = body.trim().startsWith('{')
+                ? JSON.parse(body)
+                : {error: 'This server does not know /api/exif - it is running '
+                         + 'older code than this page. Restart it.'};
+        } else if (!res.ok) {
+            data = {error: `The server answered ${res.status} for this file.`};
+        } else {
+            data = await res.json();
+        }
     } catch (err) {
-        data = {error: 'Could not read this file'};
+        data = {error: `Could not read this file (${err.message})`};
     }
     clearTimeout(slow);
 
@@ -5854,9 +5887,12 @@ function renderExif(data) {
     ].filter(([, value]) => value);
 
     const item = media.find(i => i.path === data.path);
-    const nothing = item && item.is_video
-        ? 'Videos carry no EXIF.'
-        : 'No EXIF in this file - scanners, screenshots and exports often strip it.';
+    const nothing = !data.size
+        ? 'This file is empty - 0 bytes on disk, so there is nothing to read. '
+          + 'It was most likely never copied through.'
+        : item && item.is_video
+            ? 'Videos carry no EXIF.'
+            : 'No EXIF in this file - scanners, screenshots and exports often strip it.';
 
     let html = '<h3>Photo</h3>';
     html += (data.fields || []).length
