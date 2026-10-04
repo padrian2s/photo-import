@@ -2,6 +2,7 @@
 Web server for browsing photos in hierarchical directory structure.
 """
 
+import hashlib
 import json
 import mimetypes
 import os
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 from io import BytesIO
 
+from . import __version__
 from .expander import get_directory_tree, list_images_in_directory
 from .favorites import FavoritesStore
 from .jobs import JobBusy, JobManager, PHOTO, VIDEO
@@ -197,6 +199,8 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
         manager = self.job_manager
         self.send_json({
             "root": self.root_directory,
+            "build": ui_build_id(),
+            "version": __version__,
             "has_pil": HAS_PIL,
             "has_heif": HAS_HEIF,
             "favorites": self.favorites.count() if self.favorites else 0,
@@ -1095,7 +1099,7 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
 
     def send_index(self):
         """Send the main HTML page."""
-        html = get_index_html()
+        html = get_index_html().replace('__BUILD__', ui_build_id())
         content = html.encode('utf-8')
         self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
@@ -1117,7 +1121,7 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
 
     def send_javascript(self):
         """Send JavaScript."""
-        js = get_app_js()
+        js = get_app_js().replace('__BUILD__', ui_build_id())
         content = js.encode('utf-8')
         self.send_response(200)
         self.send_header('Content-Type', 'application/javascript; charset=utf-8')
@@ -1548,6 +1552,24 @@ def run_server(
         server.shutdown()
 
 
+def ui_build_id() -> str:
+    """Fingerprint of the UI this process serves.
+
+    The page, stylesheet and script are built into the server, so a browser
+    holding an older copy of any of them is looking at a different app than
+    the one answering its requests. Both sides carry this id and the page
+    says so when they disagree.
+    """
+    global _BUILD_ID
+    if _BUILD_ID is None:
+        payload = (get_styles_css() + get_app_js()).encode('utf-8')
+        _BUILD_ID = hashlib.sha1(payload).hexdigest()[:8]
+    return _BUILD_ID
+
+
+_BUILD_ID: Optional[str] = None
+
+
 def get_index_html() -> str:
     """Return the main HTML page."""
     return '''<!DOCTYPE html>
@@ -1863,6 +1885,12 @@ def get_index_html() -> str:
                 <h2>Server</h2>
                 <div id="server-info" class="server-info"></div>
             </div>
+        </div>
+
+        <!-- Shown only when the page and the server disagree about the build -->
+        <div class="stale-bar" id="stale-bar" hidden>
+            This page is older than the server it is talking to.
+            <button class="btn" id="btn-stale-reload">Reload</button>
         </div>
 
         <!-- Lightbox overlay -->
@@ -4385,6 +4413,41 @@ select.btn {
     padding: 0 16px;
 }
 
+/* The page and the server drifting apart is otherwise invisible */
+.stale-bar {
+    position: fixed;
+    left: 50%;
+    bottom: 16px;
+    transform: translateX(-50%);
+    z-index: 2500;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px 8px 14px;
+    border: 1px solid var(--warn);
+    border-radius: 8px;
+    background: var(--warn-soft);
+    color: var(--warn);
+    font-size: 12.5px;
+    box-shadow: 0 10px 30px rgba(0,0,0,.3);
+}
+
+.stale-bar[hidden] {
+    display: none;
+}
+
+.stale-bar .btn {
+    height: 24px;
+    border-color: var(--warn);
+    background: transparent;
+    color: var(--warn);
+    font-weight: 600;
+}
+
+.stale-bar .btn:hover {
+    background: var(--surface);
+}
+
 /* ---------------------------------------------------------- help overlay */
 
 .help-overlay {
@@ -4526,7 +4589,12 @@ select.btn {
 
 def get_app_js() -> str:
     """Return JavaScript."""
-    return '''// State
+    return '''// The UI this script was served with. The server stamps the same id into
+// /api/config, so a page kept by the browser past a server restart can say so
+// instead of quietly misbehaving.
+const BUILD = '__BUILD__';
+
+// State
 let currentPath = '.';
 let currentPage = 1;
 let perPage = 50;
@@ -4620,6 +4688,9 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch (err) { /* keep the default */ }
     applyTreeShown();
     document.getElementById('btn-theme').addEventListener('click', toggleTheme);
+    document.getElementById('btn-stale-reload').addEventListener('click', () => {
+        location.reload();
+    });
     document.getElementById('btn-tree').addEventListener('click', toggleTree);
     document.getElementById('btn-size').addEventListener('click', toggleSizeDialog);
 
@@ -6167,6 +6238,12 @@ async function initManage() {
 
     updateFavoriteCount(serverConfig.favorites || 0);
     if (!batchView) renderBreadcrumb(currentPath);
+
+    // A page older than the server is the one failure with no symptom
+    if (serverConfig.build && BUILD !== '__BUILD__' && serverConfig.build !== BUILD) {
+        const bar = document.getElementById('stale-bar');
+        if (bar) bar.hidden = false;
+    }
 
     if (!serverConfig.import_enabled) {
         document.querySelectorAll('.import-only').forEach(el => el.classList.add('hidden'));
