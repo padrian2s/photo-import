@@ -464,9 +464,20 @@ class JobManager:
         workers: Optional[int] = None,
     ) -> Job:
         """Index which camera took every photo under a path."""
+        from .exif_reader import HAS_EXIFREAD, HAS_PIL
+
         root = Path(path).expanduser().resolve()
         if not root.is_dir():
             raise ValueError(f"Folder not found: {root}")
+
+        if not HAS_EXIFREAD and not HAS_PIL:
+            # Without a reader every row would be blank, and the skip list
+            # would then keep those blanks forever. Refuse the walk instead.
+            raise ValueError(
+                "No EXIF reader installed, so the index would be all blanks. "
+                "Start the server from the project venv - ./photo-import serve "
+                "- or install Pillow and exifread into the Python running it."
+            )
 
         job = self._create(
             "cameras", "files",

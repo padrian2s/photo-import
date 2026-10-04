@@ -526,6 +526,11 @@ def read_exif_summary(filepath: str | Path) -> dict:
     filepath = Path(filepath)
     empty = {'fields': [], 'tags': [], 'source': None}
 
+    if not HAS_EXIFREAD and not HAS_PIL:
+        # Nothing here can read a tag. Say that, rather than let every photo
+        # in the library look like it was shot without a camera.
+        return {'fields': [], 'tags': [], 'source': 'unavailable'}
+
     if not filepath.is_file():
         return empty
 

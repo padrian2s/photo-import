@@ -6459,7 +6459,11 @@ function renderExif(data) {
     ].filter(([, value]) => value);
 
     const item = media.find(i => i.path === data.path);
-    const nothing = !data.size
+    const nothing = data.source === 'unavailable'
+        ? 'This server has no EXIF reader installed, so it cannot see the tags '
+          + 'in any photo. Start it from the project venv - ./photo-import serve '
+          + '- or install Pillow and exifread into the Python running it.'
+        : !data.size
         ? 'This file is empty - 0 bytes on disk, so there is nothing to read. '
           + 'It was most likely never copied through.'
         : item && item.is_video

@@ -1,7 +1,12 @@
-#!/Library/Frameworks/Python.framework/Versions/3.12/bin/python3
-import sys
-from photo_import.cli import main
-if __name__ == '__main__':
-    if sys.argv[0].endswith('.exe'):
-        sys.argv[0] = sys.argv[0][:-4]
-    sys.exit(main())
+#!/usr/bin/env bash
+# Run the CLI with the project's own interpreter, wherever the checkout sits.
+# A hard-coded shebang points at whatever Python the last machine had; the
+# venv beside this script is the one that actually has Pillow and exifread.
+set -e
+here="$(cd "$(dirname "$0")" && pwd)"
+
+if [ -x "$here/.venv/bin/python" ]; then
+    exec "$here/.venv/bin/python" -m photo_import.cli "$@"
+fi
+
+exec uv run --project "$here" photo-import "$@"
