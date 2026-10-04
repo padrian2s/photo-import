@@ -786,6 +786,17 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
         # Always show all directories, paginate only files
         total_files = len(files)
         total_pages = max(1, (total_files + per_page - 1) // per_page)
+
+        # Asked to land on the page holding one particular file (reveal)
+        locate = query.get('locate', [''])[0]
+        located = None
+        if locate:
+            for index, item in enumerate(files):
+                if item["path"] == locate:
+                    page = index // per_page + 1
+                    located = locate
+                    break
+
         page = max(1, min(page, total_pages))
 
         start_idx = (page - 1) * per_page
@@ -801,6 +812,7 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
             "parent": str(Path(relative_path).parent) if relative_path != '.' else None,
             "sort": sort_by,
             "order": sort_order,
+            "located": located,
             "pagination": {
                 "page": page,
                 "per_page": per_page,
@@ -1882,6 +1894,7 @@ def get_index_html() -> str:
                         </select>
                     </span>
                     <button class="btn import-only" id="btn-import-here" title="Scan this folder as an import source">Import this folder</button>
+                    <button class="btn" id="btn-reveal" title="Jump to this photo's folder in the tree (R)" data-shortcut="R">Reveal</button>
                     <button class="btn" id="btn-size" title="Size of the selected folder (S)" data-shortcut="S">Size</button>
                 </div>
 
@@ -2234,6 +2247,7 @@ def get_index_html() -> str:
                         <div class="help-row"><kbd>B</kbd> Files of one import</div>
                         <div class="help-row"><kbd>I</kbd> Photo info (EXIF)</div>
                         <div class="help-row"><kbd>O</kbd> Open in the desktop viewer</div>
+                        <div class="help-row"><kbd>R</kbd> Reveal the photo's folder</div>
                         <div class="help-row"><kbd>S</kbd> Size of selected folder</div>
                         <div class="help-row"><kbd>*</kbd> Favorite selected item</div>
                     </div>
@@ -5001,6 +5015,7 @@ let cameraView = null;       // {name, info} when the grid shows one camera
 let cameraMeasure = 'photos';  // what the bars in the Cameras table measure
 let sortBeforeCamera = null;   // the sort to put back on the way out
 let lastCameraRows = [];       // kept so the treemap can be redrawn on resize
+let pendingReveal = null;      // a file the next listing should land on
 let sizePath = '.';          // folder shown in the size dialog
 let sizeParent = null;
 
@@ -5056,6 +5071,9 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     document.getElementById('btn-tree').addEventListener('click', toggleTree);
     document.getElementById('btn-size').addEventListener('click', toggleSizeDialog);
+    document.getElementById('btn-reveal').addEventListener('click', () => {
+        revealInNavigator(revealTarget());
+    });
 
     // The job pill opens the detail popover
     jobPillEl.addEventListener('click', () => {
@@ -5240,6 +5258,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (e.key === '*') toggleFavorite(currentMediaPath);
             if (e.key === 'i' || e.key === 'I') toggleExif();
             if (e.key === 'o' || e.key === 'O') openInViewer();
+            if (e.key === 'r' || e.key === 'R') revealInNavigator(currentMediaPath);
             return;
         }
 
@@ -5359,6 +5378,11 @@ document.addEventListener('DOMContentLoaded', () => {
         if (key === 't') {
             e.preventDefault();
             toggleTree();
+            return;
+        }
+        if (key === 'r') {
+            e.preventDefault();
+            revealInNavigator(revealTarget());
             return;
         }
 
@@ -5535,6 +5559,11 @@ async function loadDirectory(path, page = 1, restore = null) {
         } else {
             const endpoint = recursiveMode ? '/api/all' : '/api/list';
             url = `${endpoint}?path=${encodeURIComponent(path)}&${common}`;
+
+            // Reveal: let the server say which page holds the file
+            if (pendingReveal && !recursiveMode) {
+                url += `&locate=${encodeURIComponent(pendingReveal)}`;
+            }
         }
 
         const res = await fetch(url);
@@ -5545,10 +5574,13 @@ async function loadDirectory(path, page = 1, restore = null) {
             return;
         }
 
-        // Update pagination state
+        // Update pagination state. The server has the last word on the page -
+        // it clamps out-of-range ones, and reveal asks it to pick the page
+        // holding a particular file.
         const pag = data.pagination;
         totalPages = pag.total_pages;
         totalFiles = pag.total_files;
+        currentPage = pag.page;
 
         // Store all items for filtering
         allItems = data.items;
@@ -5574,7 +5606,10 @@ async function loadDirectory(path, page = 1, restore = null) {
         // Update file count
         updateFileCount(pag);
 
-        if (restore) {
+        if (pendingReveal) {
+            selectRevealedItem(pendingReveal);
+            pendingReveal = null;
+        } else if (restore) {
             // Coming back to a folder we have seen before
             if (restore.selectedIndex >= 0) highlightItem(restore.selectedIndex);
             fileGridEl.scrollTop = restore.scrollTop || 0;
@@ -5864,6 +5899,86 @@ function libraryName() {
     const parts = (serverConfig.root || '').split('/').filter(Boolean);
     const name = parts.length ? parts[parts.length - 1] : '';
     return name && name !== '.' ? name : 'Home';
+}
+
+// ---------------------------------------------------------------------------
+// R - from a photo in a flat view to where it actually lives
+// ---------------------------------------------------------------------------
+
+// Open the tree down to a folder and mark it, the way clicking there would
+async function expandTreeTo(folder) {
+    await loadTreeNode('.');
+    if (folder === '.') return;
+
+    const parts = folder.split('/');
+    let walked = '';
+    for (const part of parts) {
+        walked = walked ? `${walked}/${part}` : part;
+        const node = treeEl.querySelector(`.tree-folder[data-path="${CSS.escape(walked)}"]`);
+        if (!node) break;
+        if (node.classList.contains('has-children')) {
+            await loadTreeNode(walked);
+            node.classList.add('open');
+        }
+    }
+
+    treeEl.querySelectorAll('.tree-folder.active').forEach(el => el.classList.remove('active'));
+    const target = treeEl.querySelector(`.tree-folder[data-path="${CSS.escape(folder)}"]`);
+    if (target) {
+        target.classList.add('active');
+        target.scrollIntoView({block: 'nearest'});
+        const index = getVisibleTreeFolders().indexOf(target);
+        if (index >= 0) focusedTreeIndex = index;
+    }
+}
+
+// Jump out of whatever flat view is on screen, into the photo's own folder,
+// landing on the page that holds it with the file itself selected
+async function revealInNavigator(path) {
+    if (!path) return;
+
+    const parts = path.split('/');
+    parts.pop();
+    const folder = parts.join('/') || '.';
+
+    if (lightboxEl.classList.contains('active')) closeLightbox();
+
+    exitBatchView(false);
+    exitCameraView(false);
+    if (recursiveMode) {
+        recursiveMode = false;
+        document.getElementById('btn-recursive').classList.remove('active');
+        contentEl.classList.remove('recursive');
+        recursiveChipEl.hidden = true;
+    }
+
+    setView('browse');
+    await expandTreeTo(folder);
+
+    pendingReveal = path;
+    await loadDirectory(folder, 1);
+}
+
+// After the listing lands, put the selection on the file that was asked for
+function selectRevealedItem(path) {
+    const items = [...fileGridEl.querySelectorAll('.file-item')];
+    const index = items.findIndex(item => item.dataset.path === path);
+    if (index < 0) {
+        fileGridEl.scrollTop = 0;
+        return;
+    }
+
+    setFocusedPanel('content');
+    selectItem(index, items);
+    items[index].scrollIntoView({block: 'center'});
+}
+
+// Whatever the user would call "this photo": the lightbox, then the selection
+function revealTarget() {
+    if (lightboxEl.classList.contains('active') && currentMediaPath) return currentMediaPath;
+    const selected = fileGridEl.querySelectorAll('.file-item')[selectedIndex];
+    if (selected && !selected.classList.contains('folder')) return selected.dataset.path;
+    return null;
 }
 
 // ---------------------------------------------------------------------------

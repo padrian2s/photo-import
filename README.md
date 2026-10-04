@@ -133,6 +133,10 @@ Notes:
   import and counts what it cannot show - files deleted since, and files that
   landed outside the served folder; the × on it (or **B** again, or clicking any
   folder) goes back to where you were. **Batches - Show N imported files** opens the same view.
+- **Reveal** (**R**) answers "where does this one actually live?". From a flat
+  view - one camera, one import, or **V** - it drops out of it, opens the tree
+  down to the photo's own folder, turns to the page holding it and leaves it
+  selected. It works from the lightbox too, closing it on the way.
 - **V** flattens a year, month or day into one thumbnail grid - every photo below it, paginated, with the folder printed under each tile. Press **V** again (or walk to another folder) to go back to the normal listing.
 - RAW files (`.arw`, `.orf`, `.cr2`, `.nef`, `.dng`, ...) are listed and counted as photos, shown with a RAW tile instead of a thumbnail - Pillow cannot render them.
 - **Cameras** reads the camera out of every photo under a folder and keeps it
