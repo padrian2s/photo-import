@@ -1100,6 +1100,7 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.send_header('Content-Length', len(content))
+        self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
         self.wfile.write(content)
 
@@ -1110,6 +1111,7 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'text/css; charset=utf-8')
         self.send_header('Content-Length', len(content))
+        self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
         self.wfile.write(content)
 
@@ -1120,6 +1122,7 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'application/javascript; charset=utf-8')
         self.send_header('Content-Length', len(content))
+        self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
         self.wfile.write(content)
 
@@ -5779,10 +5782,15 @@ function renderExif(data) {
         ['Modified', formatStamp(data.modified)],
     ].filter(([, value]) => value);
 
+    const item = media.find(i => i.path === data.path);
+    const nothing = item && item.is_video
+        ? 'Videos carry no EXIF.'
+        : 'No EXIF in this file - scanners, screenshots and exports often strip it.';
+
     let html = '<h3>Photo</h3>';
     html += (data.fields || []).length
         ? rows(data.fields)
-        : '<div class="exif-empty">No EXIF in this file.</div>';
+        : `<div class="exif-empty">${nothing}</div>`;
 
     html += '<h3 style="margin-top:16px">File</h3>' + rows(file);
 
