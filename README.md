@@ -132,8 +132,11 @@ Notes:
 - RAW files (`.arw`, `.orf`, `.cr2`, `.nef`, `.dng`, ...) are listed and counted as photos, shown with a RAW tile instead of a thumbnail - Pillow cannot render them.
 - **Cameras** reads the camera out of every photo under a folder and keeps it
   in the database, then lists one row per body: how many photos, how much disk,
-  and the first and last shot. The bar is the chart; **By photos / By size**
-  switches what it measures. Clicking a camera opens its photos in Browse,
+  and the first and last shot. Above the table the same numbers are a treemap:
+  one rectangle per camera, its area the measure, its name in the middle;
+  **By photos / By size** switches which of the two the areas stand for, and
+  the long tail collapses into one "N more cameras" rectangle so the readable
+  ones stay readable. Clicking a camera opens its photos in Browse,
   oldest first, with the date under each one - so the first and the last are
   simply the first and last tiles. Photos whose EXIF says nothing land under
   **Without EXIF**. Indexing again only reads what changed, so a second pass

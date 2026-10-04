@@ -1931,6 +1931,7 @@ def get_index_html() -> str:
                 </div>
 
                 <div class="storage-summary" id="cameras-summary" style="margin-top:16px"></div>
+                <div class="treemap" id="cameras-treemap"></div>
                 <div id="cameras-table"></div>
             </div>
         </div>
@@ -4252,6 +4253,90 @@ select.btn {
     color: var(--muted);
 }
 
+/* The cameras chart: one rectangle per body, area is the measure */
+.treemap {
+    position: relative;
+    width: 100%;
+    height: 320px;
+    margin-bottom: 16px;
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+}
+
+.treemap[hidden] {
+    display: none;
+}
+
+.treemap-cell {
+    position: absolute;
+    overflow: hidden;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background: var(--accent);
+    color: var(--accent-fg);
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    gap: 2px;
+    transition: filter 0.12s;
+}
+
+.treemap-cell:hover {
+    filter: brightness(1.12);
+}
+
+/* The grouped tail stands for many cameras, so it opens none of them */
+.treemap-cell.rest {
+    background: var(--sunk);
+    color: var(--muted);
+    cursor: default;
+}
+
+.treemap-cell.rest:hover {
+    filter: none;
+}
+
+.treemap-cell.narrow .tm-name {
+    font-size: 11.5px;
+    -webkit-line-clamp: 3;
+}
+
+.treemap-cell .tm-name {
+    font-size: 12.5px;
+    font-weight: 600;
+    line-height: 1.2;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+}
+
+.treemap-cell .tm-value {
+    font-family: var(--mono);
+    font-size: 11px;
+    opacity: 0.85;
+    white-space: nowrap;
+}
+
+/* Too small to letter - the tooltip still tells you what it is */
+.treemap-cell.tiny {
+    padding: 0;
+}
+
+.treemap-cell.tiny .tm-name,
+.treemap-cell.tiny .tm-value {
+    display: none;
+}
+
+.treemap-cell.narrow .tm-value {
+    display: none;
+}
+
 /* --------------------------------------------------------------- storage */
 
 .storage-path {
@@ -4851,6 +4936,7 @@ let exifOpen = false;        // I: the EXIF panel beside the photo
 let cameraView = null;       // {name, info} when the grid shows one camera
 let cameraMeasure = 'photos';  // what the bars in the Cameras table measure
 let sortBeforeCamera = null;   // the sort to put back on the way out
+let lastCameraRows = [];       // kept so the treemap can be redrawn on resize
 let sizePath = '.';          // folder shown in the size dialog
 let sizeParent = null;
 
@@ -6614,6 +6700,19 @@ async function initManage() {
         const link = e.target.closest('[data-camera]');
         if (link) enterCameraView(link.dataset.camera);
     });
+    document.getElementById('cameras-treemap').addEventListener('click', (e) => {
+        const cell = e.target.closest('[data-camera]');
+        if (cell) enterCameraView(cell.dataset.camera);
+    });
+
+    // Rectangles are laid out in pixels, so they need redrawing when the
+    // window changes width
+    let resizeTimer = null;
+    window.addEventListener('resize', () => {
+        if (currentView !== 'cameras' || !lastCameraRows.length) return;
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => renderCameraTreemap(lastCameraRows), 150);
+    });
     document.getElementById('btn-refresh-jobs').addEventListener('click', () => renderJobHistory(latestJobs));
     document.getElementById('job-cancel').addEventListener('click', cancelWatchedJob);
     document.getElementById('job-dismiss').addEventListener('click', () => {
@@ -7326,8 +7425,14 @@ function renderCameras(data) {
     const table = document.getElementById('cameras-table');
     if (rows.length === 0) {
         table.innerHTML = '<div class="card-hint">Nothing indexed yet - pick a folder and press Index cameras.</div>';
+        const box = document.getElementById('cameras-treemap');
+        box.hidden = true;
+        box.innerHTML = '';
         return;
     }
+
+    lastCameraRows = rows;
+    renderCameraTreemap(rows);
 
     // The bar is the chart: longest bar is whichever camera leads the measure
     const value = (row) => cameraMeasure === 'bytes' ? (row.bytes || 0) : row.photos;
@@ -7360,6 +7465,134 @@ function renderCameras(data) {
             <tbody>${body}</tbody>
         </table>
     `;
+}
+
+// Squarified treemap: fill a box with rectangles whose areas are the values,
+// laying each run along the shorter side of whatever space is left so the
+// shapes stay close to square instead of turning into ribbons.
+function treemapRows(values, width, height) {
+    const total = values.reduce((sum, value) => sum + value, 0);
+    if (!total || width <= 0 || height <= 0) return [];
+
+    const areas = values.map(value => value * (width * height) / total);
+    const cells = [];
+
+    // How far from square the worst rectangle of a run would be
+    const worst = (sum, smallest, largest, side) => {
+        if (!sum) return Infinity;
+        const s2 = sum * sum;
+        const side2 = side * side;
+        return Math.max(side2 * largest / s2, s2 / (side2 * smallest));
+    };
+
+    let free = {x: 0, y: 0, w: width, h: height};
+    let index = 0;
+
+    while (index < areas.length && free.w > 0.5 && free.h > 0.5) {
+        const side = Math.min(free.w, free.h);
+
+        let sum = areas[index];
+        let smallest = areas[index];
+        let largest = areas[index];
+        let count = 1;
+
+        while (index + count < areas.length) {
+            const next = areas[index + count];
+            const current = worst(sum, smallest, largest, side);
+            const widened = worst(sum + next, Math.min(smallest, next),
+                                  Math.max(largest, next), side);
+            if (widened > current) break;
+            sum += next;
+            smallest = Math.min(smallest, next);
+            largest = Math.max(largest, next);
+            count += 1;
+        }
+
+        if (free.w >= free.h) {
+            // A column down the left of what is free
+            const columnWidth = Math.min(free.w, sum / free.h);
+            let top = free.y;
+            for (let i = index; i < index + count; i++) {
+                const cellHeight = columnWidth > 0 ? areas[i] / columnWidth : 0;
+                cells.push({x: free.x, y: top, w: columnWidth, h: cellHeight});
+                top += cellHeight;
+            }
+            free = {x: free.x + columnWidth, y: free.y,
+                    w: free.w - columnWidth, h: free.h};
+        } else {
+            // A row across the top of what is free
+            const rowHeight = Math.min(free.h, sum / free.w);
+            let left = free.x;
+            for (let i = index; i < index + count; i++) {
+                const cellWidth = rowHeight > 0 ? areas[i] / rowHeight : 0;
+                cells.push({x: left, y: free.y, w: cellWidth, h: rowHeight});
+                left += cellWidth;
+            }
+            free = {x: free.x, y: free.y + rowHeight,
+                    w: free.w, h: free.h - rowHeight};
+        }
+
+        index += count;
+    }
+
+    return cells;
+}
+
+// Past this many rectangles the small ones are slivers nobody can read
+const TREEMAP_CELLS = 20;
+
+function renderCameraTreemap(rows) {
+    const box = document.getElementById('cameras-treemap');
+    const value = (row) => cameraMeasure === 'bytes' ? (row.bytes || 0) : row.photos;
+    const ranked = [...rows].filter(row => value(row) > 0).sort((a, b) => value(b) - value(a));
+
+    if (!ranked.length) {
+        box.hidden = true;
+        box.innerHTML = '';
+        return;
+    }
+
+    // The long tail becomes one rectangle, so the readable ones stay readable
+    let shown = ranked;
+    if (ranked.length > TREEMAP_CELLS) {
+        const tail = ranked.slice(TREEMAP_CELLS - 1);
+        shown = ranked.slice(0, TREEMAP_CELLS - 1).concat([{
+            camera: null,
+            rest: tail.length,
+            photos: tail.reduce((sum, row) => sum + row.photos, 0),
+            bytes: tail.reduce((sum, row) => sum + (row.bytes || 0), 0),
+        }]);
+    }
+
+    // Shown first, measured second - a hidden box has no width to lay out in
+    box.hidden = false;
+    const width = box.clientWidth;
+    const height = box.clientHeight;
+    if (!width || !height) return;
+
+    const cells = treemapRows(shown.map(value), width, height);
+    const gap = 2;
+
+    box.innerHTML = shown.map((row, index) => {
+        const cell = cells[index];
+        if (!cell) return '';
+
+        const name = row.rest ? `${row.rest} more cameras`
+            : (row.camera || 'Without EXIF');
+        const counts = `${row.photos.toLocaleString()} photos \u00b7 ${formatGB(row.bytes || 0)}`;
+        const w = Math.max(0, cell.w - gap);
+        const h = Math.max(0, cell.h - gap);
+        const size = w < 56 || h < 26 ? ' tiny' : (w < 150 ? ' narrow' : '');
+        const rest = row.rest ? ' rest' : '';
+        const target = row.rest ? '' : ` data-camera="${escapeHtml(row.camera || '')}"`;
+
+        return `<div class="treemap-cell${size}${rest}"${target}
+                     style="left:${cell.x}px;top:${cell.y}px;width:${w}px;height:${h}px"
+                     title="${escapeHtml(name)} - ${escapeHtml(counts)}">
+                    <span class="tm-name">${escapeHtml(name)}</span>
+                    <span class="tm-value">${escapeHtml(counts)}</span>
+                </div>`;
+    }).join('');
 }
 
 async function startCameraScan() {
