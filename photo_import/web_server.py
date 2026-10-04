@@ -137,6 +137,7 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
             '/api/retry': self.start_retry_job,
             '/api/expand': self.start_expand_job,
             '/api/cameras/scan': self.start_camera_job,
+            '/api/open': self.open_in_viewer,
             '/api/job/cancel': self.cancel_job,
             '/api/conflicts/resolve': self.start_resolve_job,
         }
@@ -571,6 +572,60 @@ class PhotoBrowserHandler(SimpleHTTPRequestHandler):
 
         job = self.job_manager.start_retry(payload.get('media', PHOTO), int(batch_id))
         self.send_json(job.to_dict(), 202)
+
+    def open_in_viewer(self, payload: dict):
+        """Hand a photo to whatever this desktop opens photos with.
+
+        The server runs on the same machine as the browser, so it can do what
+        the page cannot. Only files inside the served folder, and only when
+        the import tools are enabled - launching applications is more than
+        browsing.
+        """
+        import subprocess
+        import sys
+
+        relative_path = payload.get('path') or ''
+        if not relative_path:
+            raise ValueError("path is required")
+
+        root = Path(self.root_directory).resolve()
+        full_path = root / relative_path
+
+        try:
+            full_path.resolve().relative_to(root)
+        except ValueError:
+            self.send_json({"error": "Access denied"}, 403)
+            return
+
+        if not full_path.is_file():
+            self.send_json({"error": "File not found"}, 404)
+            return
+
+        if sys.platform == 'darwin':
+            command = ['open', str(full_path)]
+        elif sys.platform.startswith('linux'):
+            command = ['xdg-open', str(full_path)]
+        else:
+            self.send_json(
+                {"error": f"Opening files is not wired up for {sys.platform}"}, 501)
+            return
+
+        try:
+            # A list, never a shell - the path is data, not script
+            result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        except FileNotFoundError:
+            self.send_json({"error": f"{command[0]} is not available here"}, 501)
+            return
+        except subprocess.TimeoutExpired:
+            self.send_json({"error": "The viewer did not answer"}, 504)
+            return
+
+        if result.returncode != 0:
+            message = (result.stderr or '').strip() or f"{command[0]} failed"
+            self.send_json({"error": message}, 500)
+            return
+
+        self.send_json({"opened": relative_path, "with": command[0]})
 
     def start_camera_job(self, payload: dict):
         """Index which camera took every photo under a folder."""
@@ -2092,6 +2147,7 @@ def get_index_html() -> str:
                 <span class="lightbox-name" id="lightbox-name"></span>
                 <span class="lightbox-index" id="lightbox-index"></span>
                 <button class="lightbox-btn" id="lightbox-exif" title="Photo info (I)">&#9432;</button>
+                <button class="lightbox-btn import-only" id="lightbox-open" title="Open in the desktop photo viewer (O)">&#8599;</button>
                 <button class="lightbox-fav" id="lightbox-fav" title="Favorite (*)">&#9734;</button>
                 <button class="lightbox-close" id="lightbox-close" title="Close (Esc)">&times;</button>
             </div>
@@ -2177,6 +2233,7 @@ def get_index_html() -> str:
                         <div class="help-row"><kbd>V</kbd> All photos below folder</div>
                         <div class="help-row"><kbd>B</kbd> Files of one import</div>
                         <div class="help-row"><kbd>I</kbd> Photo info (EXIF)</div>
+                        <div class="help-row"><kbd>O</kbd> Open in the desktop viewer</div>
                         <div class="help-row"><kbd>S</kbd> Size of selected folder</div>
                         <div class="help-row"><kbd>*</kbd> Favorite selected item</div>
                     </div>
@@ -3308,8 +3365,15 @@ select.btn {
 }
 
 .lightbox-btn {
-    margin-left: auto;
     font-size: 17px;
+}
+
+#lightbox-exif {
+    margin-left: auto;
+}
+
+#lightbox-open {
+    font-size: 16px;
 }
 
 .lightbox-fav {
@@ -5026,6 +5090,10 @@ document.addEventListener('DOMContentLoaded', () => {
         e.stopPropagation();
         toggleExif();
     });
+    document.getElementById('lightbox-open').addEventListener('click', (e) => {
+        e.stopPropagation();
+        openInViewer();
+    });
     try {
         exifOpen = localStorage.getItem('photoBrowserExif') === '1';
     } catch (err) { /* keep it closed */ }
@@ -5171,6 +5239,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (e.key === 'ArrowRight') nextImage();
             if (e.key === '*') toggleFavorite(currentMediaPath);
             if (e.key === 'i' || e.key === 'I') toggleExif();
+            if (e.key === 'o' || e.key === 'O') openInViewer();
             return;
         }
 
@@ -6295,6 +6364,29 @@ function renderExif(data) {
     }
 
     exifPanelEl.innerHTML = html;
+}
+
+// The page cannot launch an application, but the server is on this machine
+// and can - so it hands the file to whatever opens photos here.
+async function openInViewer() {
+    if (!currentMediaPath || !serverConfig.import_enabled) return;
+
+    const button = document.getElementById('lightbox-open');
+    const previous = lightboxInfoEl.textContent;
+    button.disabled = true;
+
+    try {
+        await api('POST', '/api/open', {path: currentMediaPath});
+    } catch (err) {
+        lightboxInfoEl.textContent = `Could not open it: ${err.message}`;
+        setTimeout(() => {
+            if (lightboxInfoEl.textContent.startsWith('Could not open it')) {
+                lightboxInfoEl.textContent = previous;
+            }
+        }, 4000);
+    } finally {
+        button.disabled = false;
+    }
 }
 
 function prevImage() {

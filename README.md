@@ -110,6 +110,11 @@ Notes:
   show. **T** hides the folder tree when the grid wants the room.
 - **List** (**L**) is a real table - name, kind, size and modified date - and
   **Grid** (**G**) is the thumbnail wall.
+- Next to it, **↗** (or **O**) hands the photo to whatever this desktop opens
+  photos with - Preview on a Mac, the default viewer on Linux. The server is
+  on the same machine as the browser, which is how a web page gets to do that;
+  it is off in `--no-import` mode, since launching applications is more than
+  browsing.
 - In the lightbox, the **ⓘ** button (or **I**) opens what the camera wrote
   next to the photo: body and lens, shutter, aperture, ISO, focal length,
   when it was taken, GPS if there is any, plus every raw tag under **All
