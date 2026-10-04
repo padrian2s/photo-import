@@ -6681,12 +6681,20 @@ function renderServerInfo() {
         ? `available${serverConfig.has_heif ? ' \u00b7 HEIC supported' : ''}`
         : 'not installed';
 
+    // The server prints the same build id when it starts, so the two can be
+    // compared without guessing which code is answering
+    const build = serverConfig.build === BUILD
+        ? `${serverConfig.build} (page matches)`
+        : `${serverConfig.build} - this page is ${BUILD}, reload it`;
+
     const rows = [
         ['Serving', serverConfig.root || ''],
         ['Photo database', serverConfig.db_path || ''],
         ['Video database', serverConfig.video_db_path || ''],
         ['Default workers', String(serverConfig.default_workers || '')],
         ['Thumbnails (Pillow)', thumbs],
+        ['Version', String(serverConfig.version || '')],
+        ['UI build', build],
     ];
 
     document.getElementById('server-info').innerHTML = rows.map(([label, value]) =>
