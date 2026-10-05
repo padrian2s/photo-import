@@ -6000,7 +6000,8 @@ function renderCameraChip(info) {
         ? `${formatBatchDate(info.first)} \u2192 ${formatBatchDate(info.last)}`
         : 'no dates in these files';
 
-    let html = `<b>${escapeHtml(info.name || 'Unknown camera')}</b>`;
+    // The same files are called this in the table; one name for one thing
+    let html = `<b>${escapeHtml(info.name || 'Without EXIF')}</b>`;
     html += `<span class="mono">${(info.shown || 0).toLocaleString()} photos</span>`;
     html += `<span class="mono">${escapeHtml(span)}</span>`;
 
